@@ -85,4 +85,9 @@ mkf "$ROOT/proc/5555/task/5555/comm" "com.test.app"
 mkf "$ROOT/sys/fs/cgroup/top-app/cgroup.procs" "1111
 4242"
 
+# ---------------- 充电控制（方案 A）用到的节点
+PS="$ROOT/sys/class/power_supply/battery"
+mkf "$PS/constant_charge_current_max" 6000000
+mkf "$PS/input_suspend" 0
+
 echo "fake tree ready: $ROOT"

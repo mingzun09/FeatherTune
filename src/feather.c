@@ -42,8 +42,8 @@
 #define PATH_MAX 4096
 #endif
 
-#define APP_VER   "v1.2.5"
-#define APP_VC    10007
+#define APP_VER   "v1.2.6"
+#define APP_VC    10008
 #define MAX_FREQ  64
 #define MAX_POL   4
 #define MAX_RULES 64
@@ -54,7 +54,7 @@ static int g_http_port = 7891;   // 可由 FEATHER_HTTP_PORT 覆盖（测试隔�
 static char P_DATA[PATH_MAX], P_CPU[PATH_MAX], P_CGRP[PATH_MAX], P_CPUCTL[PATH_MAX],
             P_SYS[PATH_MAX],
             P_PROC[PATH_MAX], P_HM[PATH_MAX], P_CONF[PATH_MAX], P_GAMES[PATH_MAX],
-            P_RULES[PATH_MAX], P_APPS[PATH_MAX], P_STATE[PATH_MAX], P_LOG[PATH_MAX], P_PID[PATH_MAX],
+            P_RULES[PATH_MAX], P_APPS[PATH_MAX], P_LABELS[PATH_MAX], P_ICONS[PATH_MAX], P_STATE[PATH_MAX], P_LOG[PATH_MAX], P_PID[PATH_MAX],
             P_SOCK[PATH_MAX];
 static char g_cset_node[16] = "cpuset.cpus";   // cpuset v1 用 cpus，v2 用 cpuset.cpus
 
@@ -91,6 +91,8 @@ static void path_init(void) {
     snprintf(P_GAMES, sizeof P_GAMES, "%s/games.conf", P_DATA);
     snprintf(P_RULES, sizeof P_RULES, "%s/rules.conf", P_DATA);
     snprintf(P_APPS, sizeof P_APPS, "%s/apps.conf", P_DATA);
+    snprintf(P_LABELS, sizeof P_LABELS, "%s/labels.conf", P_DATA);
+    snprintf(P_ICONS, sizeof P_ICONS, "%s/icons", P_DATA);
     snprintf(P_STATE, sizeof P_STATE, "%s/state", P_DATA);
     snprintf(P_LOG, sizeof P_LOG, "%s/feather.log", P_DATA);
     snprintf(P_PID, sizeof P_PID, "%s/featherd-daemon.pid", P_DATA);
@@ -288,6 +290,8 @@ typedef struct {
     int game_min_pct, game_bg_cpus;
     char mode[16];
     char hm_coeff[48], hm_high[48], hm_heavy[64];
+    int  charge_ctrl, charge_knee_soc, charge_temp_wall, charge_resume_temp;
+    char chg_curve[128];
 } cfg_t;
 
 static cfg_t C;
@@ -444,6 +448,9 @@ static void cfg_defaults(void) {
     snprintf(C.hm_coeff, sizeof C.hm_coeff, "1152,1024");
     snprintf(C.hm_high, sizeof C.hm_high, "56,60");
     snprintf(C.hm_heavy, sizeof C.hm_heavy, "0,360,128");
+    C.charge_ctrl = 1; C.charge_knee_soc = 67; C.charge_temp_wall = 43;
+    C.charge_resume_temp = 40;
+    snprintf(C.chg_curve, sizeof C.chg_curve, "36:100,38:85,40:70,42:50,43:0");
 }
 
 static int atoi_safe(const char *s, int def) {
@@ -510,6 +517,11 @@ static bool cfg_load(void) {   // 返回 true 表示内容有更新
         else if (!strcmp(key, "hmbird_coeff")) snprintf(C.hm_coeff, sizeof C.hm_coeff, "%s", val);
         else if (!strcmp(key, "hmbird_high_ratio")) snprintf(C.hm_high, sizeof C.hm_high, "%s", val);
         else if (!strcmp(key, "hmbird_heavy")) snprintf(C.hm_heavy, sizeof C.hm_heavy, "%s", val);
+        else if (!strcmp(key, "charge_ctrl")) C.charge_ctrl = atoi_safe(val, 1);
+        else if (!strcmp(key, "charge_knee_soc")) C.charge_knee_soc = atoi_safe(val, 67);
+        else if (!strcmp(key, "charge_temp_wall")) C.charge_temp_wall = atoi_safe(val, 43);
+        else if (!strcmp(key, "charge_resume_temp")) C.charge_resume_temp = atoi_safe(val, 40);
+        else if (!strcmp(key, "charge_curve")) snprintf(C.chg_curve, sizeof C.chg_curve, "%s", val);
     }
     fclose(f);
     g_log_level = C.log_level;
@@ -624,6 +636,179 @@ static void uclamp_restore(void) {
         wrp(path, "max");
     }
     g_uclamp_touched = 0;
+}
+
+static long battery_cap(void);
+static long battery_temp(void);
+static void battery_status(char *out, size_t n);
+
+/* ------------------------------------------------------------ 充电控制 --
+ * 方案 A：只做「少要一点电流」，不碰温度上报、不碰 DT。
+ *
+ *   SOC <  charge_knee_soc   → 不干预（厂商曲线自己跑，这段电池本身不热）
+ *   SOC >= charge_knee_soc   → 按电池温度查 charge_curve 降电流
+ *   温度 >= charge_temp_wall → 直接暂停充电，降到 charge_resume_temp 再恢复
+ *
+ * 作用点是充电 IC 的输入/恒流上限，SVOOC / UFCS / PPS 都要经过它，
+ * 所以三种协议同时生效。只能降不能升——这是方案 A 的边界。
+ * 所有写过的节点都在退出时还原成动手前的值。
+ */
+typedef struct {
+    char path[PATH_MAX];
+    char orig[64];
+    int  valid;
+} chg_node_t;
+
+static chg_node_t g_chg_cur;        // 恒流/输入电流上限
+static chg_node_t g_chg_suspend;    // 暂停充电开关
+static int  g_chg_ready;            // 节点已探测
+static int  g_chg_active;           // 当前正被我们接管
+static int  g_chg_suspended;
+static int  g_chg_last_pct = -1;    // 上次设置的百分比
+static long g_chg_orig_cur;         // 原始电流值（用于按比例算）
+
+// 候选节点：不同 ColorOS 版本开放的不一样，按顺序挑第一个可写的
+static const char *CHG_CUR_CANDS[] = {
+    "/class/power_supply/battery/constant_charge_current_max",
+    "/class/power_supply/battery/constant_charge_current",
+    "/class/power_supply/battery/current_max",
+    "/class/power_supply/battery/input_current_limit",
+    "/class/oplus_chg/battery/current_max",
+    "/class/oplus_chg/battery/chg_current_max",
+    "/class/oplus_chg/battery/fastchg_current_max",
+};
+static const char *CHG_SUSPEND_CANDS[] = {
+    "/class/power_supply/battery/input_suspend",
+    "/class/power_supply/battery/charge_disable",
+    "/class/power_supply/battery/charging_enabled",
+    "/class/oplus_chg/battery/input_suspend",
+};
+
+static int chg_pick(chg_node_t *n, const char **cands, size_t cnt) {
+    memset(n, 0, sizeof *n);
+    for (size_t i = 0; i < cnt; i++) {
+        char p[PATH_MAX], v[64];
+        snprintf(p, sizeof p, "%s%s", P_SYS, cands[i]);
+        if (access(p, W_OK) != 0) continue;
+        if (rdline(p, v, sizeof v) != 0) continue;
+        snprintf(n->path, sizeof n->path, "%s", p);
+        snprintf(n->orig, sizeof n->orig, "%s", v);
+        n->valid = 1;
+        return 0;
+    }
+    return -1;
+}
+
+static void charge_init(void) {
+    if (g_chg_ready) return;
+    g_chg_ready = 1;
+    if (chg_pick(&g_chg_cur, CHG_CUR_CANDS,
+                 sizeof CHG_CUR_CANDS / sizeof CHG_CUR_CANDS[0]) != 0) {
+        logv("charge: 没有可写的电流节点，充电控制停用");
+        return;
+    }
+    // 暂停开关不是必须的：没有就只靠电流兜底（设成最小值而不是 0）
+    chg_pick(&g_chg_suspend, CHG_SUSPEND_CANDS,
+             sizeof CHG_SUSPEND_CANDS / sizeof CHG_SUSPEND_CANDS[0]);
+    g_chg_orig_cur = strtol(g_chg_cur.orig, NULL, 10);
+    logv("charge: 电流节点 %s (%s) 暂停节点 %s",
+         g_chg_cur.path, g_chg_cur.orig, g_chg_suspend.valid ? g_chg_suspend.path : "无");
+}
+
+// "36:100,38:85,40:70,42:50,43:0" —— 按温度升序，取第一个 t >= 对应温度的点
+static int charge_pct_for_temp(long temp) {
+    int pct = 100;
+    char buf[128];
+    snprintf(buf, sizeof buf, "%s", C.chg_curve);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        int t = 0, p = 100;
+        if (sscanf(tok, "%d:%d", &t, &p) != 2) continue;
+        if (temp >= t) pct = p;      // 温度越高，后面覆盖前面的
+    }
+    return pct;
+}
+
+static void charge_set_pct(int pct) {
+    if (pct == g_chg_last_pct) return;
+    g_chg_last_pct = pct;
+    if (!g_chg_cur.valid) return;
+    long base = g_chg_orig_cur > 0 ? g_chg_orig_cur : 3000000;
+    long v = base / 100 * pct;
+    if (v < 100000) v = 100000;      // 别设成 0，0 在很多机型上等于"不限"
+    char b[32];
+    snprintf(b, sizeof b, "%ld", v);
+    wrp(g_chg_cur.path, b);
+}
+
+static void charge_suspend(int on) {
+    if (g_chg_suspended == on) return;
+    g_chg_suspended = on;
+    if (!g_chg_suspend.valid) return;
+    int invert = strstr(g_chg_suspend.path, "charging_enabled") != NULL;
+    wrp(g_chg_suspend.path, invert ? (on ? "0" : "1") : (on ? "1" : "0"));
+}
+
+// 每个 tick 调一次（1Hz）；不充电时什么都不做
+static void charge_tick(void) {
+    if (!C.charge_ctrl) {
+        if (g_chg_active) { charge_suspend(0); charge_set_pct(100); g_chg_active = 0; }
+        return;
+    }
+    charge_init();
+    if (!g_chg_cur.valid) return;
+
+    char st[32] = "";
+    battery_status(st, sizeof st);
+    int charging = strstr(st, "Charging") != NULL;
+    if (!charging) {
+        if (g_chg_active) {
+            charge_suspend(0);
+            charge_set_pct(100);
+            g_chg_active = 0;
+            logv("charge: 已停止充电，还原电流 %s", g_chg_cur.orig);
+        }
+        return;
+    }
+
+    long soc = battery_cap();
+    long temp = battery_temp();
+    if (soc <= 0) return;
+    g_chg_active = 1;
+
+    if (temp >= C.charge_temp_wall) {
+        if (!g_chg_suspended)
+            logmsg("charge: %.0f℃ 到温度墙 %d℃，暂停充电", (double)temp, C.charge_temp_wall);
+        charge_suspend(1);
+        charge_set_pct(0);
+        return;
+    }
+    if (g_chg_suspended) {
+        if (temp > C.charge_resume_temp) return;     // 还没凉到恢复线
+        logmsg("charge: 回到 %.0f℃（恢复线 %d℃），恢复充电", (double)temp, C.charge_resume_temp);
+        charge_suspend(0);
+    }
+
+    int pct = 100;
+    if (soc >= C.charge_knee_soc) pct = charge_pct_for_temp(temp);
+    if (pct != g_chg_last_pct)
+        logmsg("charge: SOC %ld%% %.0f℃ → 电流上限 %d%%（拐点 %d%%）",
+               soc, (double)temp, pct, C.charge_knee_soc);
+    charge_set_pct(pct);
+}
+
+static void charge_restore(void) {
+    if (g_chg_suspend.valid && g_chg_suspended) {
+        int invert = strstr(g_chg_suspend.path, "charging_enabled") != NULL;
+        wrp(g_chg_suspend.path, invert ? "1" : "0");
+        g_chg_suspended = 0;
+    }
+    if (g_chg_cur.valid) {
+        wrp(g_chg_cur.path, g_chg_cur.orig);
+        logv("charge: 已还原电流 %s", g_chg_cur.orig);
+    }
+    g_chg_active = 0;
+    g_chg_last_pct = -1;
 }
 
 // ------------------------------------------------------------------ hmbird --
@@ -1083,6 +1268,89 @@ static void apps_load(void) {
     logv("apps: 载入 %d 条应用策略", g_napps);
 }
 
+/* ---------------------------------------------------------- 名称与图标 --
+ * 名称：labels.conf（pkg=名称），WebUI 也会用同一份文件
+ * 图标：从 APK 里直接抠 res/…ic_launcher*.png，缓存在 $DATA/icons/<pkg>.png
+ *       —— 不依赖任何第三方工具，toybox 自带的 unzip 就够
+ */
+typedef struct { char pkg[128]; char name[96]; } label_t;
+#define MAX_LABELS 512
+static label_t g_labels[MAX_LABELS];
+static int g_nlabels;
+static struct timespec g_labels_mtime;
+
+static void labels_load(void) {
+    struct stat st;
+    struct timespec mt = {0, 0};
+    if (stat(P_LABELS, &st) == 0) {
+        mt.tv_sec = st.st_mtime;
+        mt.tv_nsec = st.st_mtim.tv_nsec;
+        if (timespec_eq(mt, g_labels_mtime) && g_labels_mtime.tv_sec != 0) return;
+    }
+    g_labels_mtime = mt;
+    g_nlabels = 0;
+    FILE *f = fopen(P_LABELS, "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f) && g_nlabels < MAX_LABELS) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = 0;
+        char *hash = strchr(line, '#');
+        if (hash) *hash = 0;
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *k = line, *v = eq + 1;
+        while (*k == ' ' || *k == '\t') k++;
+        while (*v == ' ' || *v == '\t') v++;
+        char *ke = k + strlen(k);
+        while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) *--ke = 0;
+        if (!*k || !*v) continue;
+        snprintf(g_labels[g_nlabels].pkg, sizeof g_labels[0].pkg, "%s", k);
+        snprintf(g_labels[g_nlabels].name, sizeof g_labels[0].name, "%s", v);
+        g_nlabels++;
+    }
+    fclose(f);
+}
+
+static const char *label_of(const char *pkg) {
+    for (int i = 0; i < g_nlabels; i++)
+        if (!strcmp(g_labels[i].pkg, pkg)) return g_labels[i].name;
+    return NULL;
+}
+
+static int pkg_ok(const char *pkg) {
+    if (!pkg || !pkg[0] || strlen(pkg) > 120) return 0;
+    for (const char *c = pkg; *c; c++)
+        if (!isalnum((unsigned char)*c) && *c != '.' && *c != '_' && *c != '-') return 0;
+    return 1;
+}
+
+// 把 APK 里的图标抠出来；成功返回 0 并写 out 路径
+static int icon_path(const char *pkg, char *out, size_t n) {
+    if (!pkg_ok(pkg)) return -1;
+    snprintf(out, n, "%s/%s.png", P_ICONS, pkg);
+    struct stat st;
+    if (stat(out, &st) == 0 && st.st_size > 0) return 0;      // 已缓存
+    mkdir(P_ICONS, 0755);
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof tmp, "%s/.i.png", P_DATA);
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd,
+        "apk=$(pm path %s 2>/dev/null | head -1 | sed 's/^package://'); "
+        "[ -n \"$apk\" ] || exit 2; "
+        "e=$(unzip -l \"$apk\" 2>/dev/null | grep -oE 'res/[^ ]*(ic_launcher|icon)[^ ]*\\.png' "
+        "| awk '{print length, $0}' | sort -n | tail -1 | cut -d' ' -f2-); "
+        "[ -n \"$e\" ] || e=$(unzip -l \"$apk\" 2>/dev/null | grep -oE 'res/mipmap[^ ]*\\.png' | tail -1); "
+        "[ -n \"$e\" ] || exit 3; "
+        "unzip -p \"$apk\" \"$e\" > %s 2>/dev/null", pkg, tmp);
+    int rc = system(cmd);
+    if (rc != 0) return -1;
+    if (stat(tmp, &st) != 0 || st.st_size < 64) { unlink(tmp); return -1; }
+    rename(tmp, out);
+    return 0;
+}
+
 static char **g_games;
 static int g_ngames, g_games_cap;
 static struct timespec g_games_mtime;
@@ -1454,9 +1722,11 @@ static void apply_profile(const char *name) {
 }
 
 static void uclamp_restore(void);
+static void charge_restore(void);
 
 static void restore_all(void) {
     uclamp_restore();
+    charge_restore();
     logv("restore_all: npol=%d extras=%d", npol, g_game_extras);
     for (int i = 0; i < npol; i++) {
         long v = (g_base_ok && g_base_max[i] > 0) ? g_base_max[i] : pol[i].max;
@@ -1599,6 +1869,10 @@ static void cmd_status(char *out, size_t n) {
     APP("cfg_gpu=%d\n", C.gpu_tune);
     APP("cfg_launch_boost=%d\n", C.launch_boost);
     APP("cfg_log_level=%d\n", C.log_level);
+    APP("cfg_charge_ctrl=%d\n", C.charge_ctrl);
+    APP("chg_last_pct=%d\n", g_chg_last_pct);
+    APP("chg_suspend=%d\n", g_chg_suspended);
+    APP("chg_node=%s\n", g_chg_cur.valid ? g_chg_cur.path : "-");
     APP("games=%d\n", g_ngames);
     APP("version=%s\n", APP_VER);
 #undef APP
@@ -1737,6 +2011,7 @@ static void run_cmd(const char *line, char *out, size_t n) {
     games_load();
     rules_load();
     apps_load();
+    labels_load();
 
     if (!strcmp(cmd, "status")) { cmd_status(out, n); return; }
     if (!strcmp(cmd, "doctor")) { cmd_doctor(out, n); return; }
@@ -1857,6 +2132,7 @@ static void run_cmd(const char *line, char *out, size_t n) {
                 g_apps_mtime.tv_sec = 0;
                 g_apps_mtime.tv_nsec = 0;
                 apps_load();
+        labels_load();
                 snprintf(out, n, "ok=app:%s mode=%s perf=%d prime=%d floor=%d thr=%d\n",
                          pkg, mode, pp, pr, fl, th);
             } else {
@@ -1907,8 +2183,10 @@ static void run_cmd(const char *line, char *out, size_t n) {
                     if (nl) *nl = 0;
                     if (!ln[0]) continue;
                     const apprule_t *ar = app_find(ln);
-                    off += (size_t)snprintf(cache + off, sizeof cache - off, "%s|%s|%d\n",
-                                            ln, ar ? ar->mode : "-", is_game(ln) ? 1 : 0);
+                    const char *lb = label_of(ln);
+                off += (size_t)snprintf(cache + off, sizeof cache - off, "%s|%s|%d|%s\n",
+                                            ln, ar ? ar->mode : "-", is_game(ln) ? 1 : 0,
+                                            lb ? lb : "");
                 }
                 pclose(pp2);
                 cache_ts = now2;
@@ -1918,17 +2196,34 @@ static void run_cmd(const char *line, char *out, size_t n) {
             if (!cache[0]) {
                 size_t off2 = 0;
                 for (int i = 0; i < g_napps && off2 + 200 < sizeof cache; i++)
-                    off2 += (size_t)snprintf(cache + off2, sizeof cache - off2, "%s|%s|%d\n",
+                    { const char *lb2 = label_of(g_apps[i].pkg);
+                      off2 += (size_t)snprintf(cache + off2, sizeof cache - off2, "%s|%s|%d|%s\n",
                                              g_apps[i].pkg, g_apps[i].mode,
-                                             is_game(g_apps[i].pkg) ? 1 : 0);
+                                             is_game(g_apps[i].pkg) ? 1 : 0, lb2 ? lb2 : ""); }
                 for (int i = 0; i < g_ngames && off2 + 200 < sizeof cache; i++) {
                     if (app_find(g_games[i])) continue;
-                    off2 += (size_t)snprintf(cache + off2, sizeof cache - off2, "%s|%s|1\n",
-                                             g_games[i], "follow");
+                    { const char *lb3 = label_of(g_games[i]);
+                      off2 += (size_t)snprintf(cache + off2, sizeof cache - off2, "%s|%s|1|%s\n",
+                                             g_games[i], "follow", lb3 ? lb3 : ""); }
                 }
             }
         }
         snprintf(out, n, "%s", cache);
+        return;
+    }
+    if (!strcmp(cmd, "labels")) {
+        size_t off = 0;
+        out[0] = 0;
+        for (int i = 0; i < g_nlabels && off + 200 < n; i++)
+            off += (size_t)snprintf(out + off, n - off, "%s=%s\n",
+                                    g_labels[i].pkg, g_labels[i].name);
+        return;
+    }
+    if (!strcmp(cmd, "icon")) {
+        char ip[PATH_MAX];
+        if (got < 2) { snprintf(out, n, "err=missing_pkg\n"); return; }
+        if (icon_path(a1, ip, sizeof ip) != 0) { snprintf(out, n, "err=no_icon\n"); return; }
+        snprintf(out, n, "ok=%s\n", ip);
         return;
     }
     if (!strcmp(cmd, "apprule")) {
@@ -1938,6 +2233,51 @@ static void run_cmd(const char *line, char *out, size_t n) {
             off += (size_t)snprintf(out + off, n - off, "%s|%s|%d|%d|%d|%d\n",
                                     g_apps[i].pkg, g_apps[i].mode, g_apps[i].perf,
                                     g_apps[i].prime, g_apps[i].floor, g_apps[i].threads);
+        return;
+    }
+    if (!strcmp(cmd, "charge")) {
+        // charge           -> 当前状态
+        // charge probe     -> 逐个列出候选节点及可写性，用来确认这台机器开放了哪个
+        size_t off = 0;
+#define CAPP(...) do { if (off < n) off += (size_t)snprintf(out + off, n - off, __VA_ARGS__); } while (0)
+        if (got >= 2 && !strcmp(a1, "probe")) {
+            CAPP("soc=%ld temp=%ld\n", battery_cap(), battery_temp());
+            char st[32] = "";
+            battery_status(st, sizeof st);
+            CAPP("status=%s\n", st);
+            static const char *all[] = {
+                "/class/power_supply/battery/constant_charge_current_max",
+                "/class/power_supply/battery/constant_charge_current",
+                "/class/power_supply/battery/current_max",
+                "/class/power_supply/battery/input_current_limit",
+                "/class/power_supply/battery/input_suspend",
+                "/class/power_supply/battery/charge_disable",
+                "/class/power_supply/battery/charging_enabled",
+                "/class/power_supply/battery/voltage_max",
+                "/class/oplus_chg/battery/current_max",
+                "/class/oplus_chg/battery/chg_current_max",
+                "/class/oplus_chg/battery/fastchg_current_max",
+                "/class/oplus_chg/battery/input_suspend",
+            };
+            for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
+                char p2[PATH_MAX], v2[64];
+                snprintf(p2, sizeof p2, "%s%s", P_SYS, all[i]);
+                int w = access(p2, W_OK) == 0;
+                int r = rdline(p2, v2, sizeof v2) == 0;
+                CAPP("%s %s %s\n", all[i], r ? "read" : "----", w ? "WRITE" : "-");
+                if (r) CAPP("    = %s\n", v2);
+            }
+            return;
+        }
+        charge_init();
+        CAPP("enabled=%d active=%d suspended=%d last_pct=%d\n",
+             C.charge_ctrl, g_chg_active, g_chg_suspended, g_chg_last_pct);
+        CAPP("node=%s orig=%s\n", g_chg_cur.valid ? g_chg_cur.path : "-", g_chg_cur.orig);
+        CAPP("suspend_node=%s\n", g_chg_suspend.valid ? g_chg_suspend.path : "-");
+        CAPP("soc=%ld temp=%ld knee=%d wall=%d resume=%d curve=%s\n",
+             battery_cap(), battery_temp(), C.charge_knee_soc, C.charge_temp_wall,
+             C.charge_resume_temp, C.chg_curve);
+#undef CAPP
         return;
     }
     if (!strcmp(cmd, "version")) { snprintf(out, n, "%s (%d)\n", APP_VER, APP_VC); return; }
@@ -2033,6 +2373,32 @@ static void http_reply(int fd, const char *body, const char *ctype) {
     if (write(fd, body, strlen(body)) < 0) { /* ignore */ }
 }
 
+// 直接把磁盘上的任意文件吐回去（应用图标用）
+static void http_serve_abs(int fd, const char *path, const char *ctype) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { http_reply(fd, "err=notfound\n", "text/plain; charset=utf-8"); return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 4 * 1024 * 1024) {
+        fclose(f);
+        http_reply(fd, "err=size\n", "text/plain; charset=utf-8");
+        return;
+    }
+    char hdr[256];
+    int n = snprintf(hdr, sizeof hdr,
+                     "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\n"
+                     "Access-Control-Allow-Origin: *\r\nCache-Control: max-age=86400\r\n"
+                     "Connection: close\r\n\r\n", ctype, sz);
+    if (write(fd, hdr, (size_t)n) < 0) { /* ignore */ }
+    char buf[8192];
+    size_t r;
+    while ((r = fread(buf, 1, sizeof buf, f)) > 0) {
+        if (write(fd, buf, r) < 0) break;
+    }
+    fclose(f);
+}
+
 // 直接由 daemon 提供给浏览器打开的 WebUI（最强的兜底通道）
 static void http_serve_file(int fd, const char *name) {
     if (strstr(name, "..") || strchr(name, '\\')) {
@@ -2116,6 +2482,25 @@ static void http_handle(int fd, char *outbuf, size_t outsz) {
             snprintf(cmd, sizeof cmd, "pkg %s %s",
                      path[7] == 'a' ? "add" : "del", p);
         } else snprintf(cmd, sizeof cmd, "err=missing_pkg");
+    } else if (!strcmp(path, "/charge")) {
+        snprintf(cmd, sizeof cmd, "charge%s", query && strstr(query, "probe") ? " probe" : "");
+    } else if (!strcmp(path, "/labels")) {
+        snprintf(cmd, sizeof cmd, "labels");
+    } else if (!strcmp(path, "/icon")) {
+        char pk[128] = "";
+        if (sscanf(query, "p=%127s", pk) == 1) {
+            url_decode(pk);
+            char ip[PATH_MAX];
+            if (icon_path(pk, ip, sizeof ip) == 0) {
+                http_serve_abs(fd, ip, "image/png");
+            } else {
+                http_reply(fd, "err=no_icon\n", "text/plain; charset=utf-8");
+            }
+        } else {
+            http_reply(fd, "err=missing_pkg\n", "text/plain; charset=utf-8");
+        }
+        close(fd);
+        return;
     } else if (!strcmp(path, "/apps")) {
         snprintf(cmd, sizeof cmd, "apps");
     } else if (!strcmp(path, "/app")) {
@@ -2367,6 +2752,8 @@ static int run_daemon(void) {
                 logv("drift: 上限被外部改写(%ld)，已重新应用", nowcap);
             }
         }
+
+        charge_tick();
 
         if (!strcmp(cur, "game") && C.thread_opt) {
             long pid = find_game_pid(last_fg);

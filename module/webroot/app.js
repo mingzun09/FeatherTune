@@ -85,10 +85,12 @@ function httpMap(cmd) {
   if (cmd === 'restore') return '/restore';
   if (cmd === 'pkg list') return '/games';
   if (cmd === 'apps') return '/apps';
+  if (cmd === 'labels') return '/labels';
   if (cmd.startsWith('app ')) return '/app?' + cmd.slice(4).split(/\s+/)
       .map((v, i) => (i === 0 ? 'op=' : i === 1 ? 'p=' : i === 2 ? 'm=' : i === 3 ? 'a=' : i === 4 ? 'b=' : i === 5 ? 'c=' : 'd=') + q(v))
       .join('&');
   if (cmd === 'apps') return '/apps';
+  if (cmd === 'labels') return '/labels';
   if (cmd.startsWith('log')) return '/log?n=' + (cmd.split(/\s+/)[1] || 60);
   if (cmd.startsWith('pkg add ')) return '/games/add?p=' + q(cmd.slice(8).trim());
   if (cmd.startsWith('pkg del ')) return '/games/del?p=' + q(cmd.slice(8).trim());
@@ -239,11 +241,11 @@ function render() {
   $('#mTemp').textContent    = state.temp ? state.temp + '°C' : '—';
   const fg = state.fg || '';
   // 完整包名，不再截断（手机上一行放不下就换行，见 .metric b 的样式）
-  $('#mFg').textContent = fg || '—';
+  $('#mFg').textContent = (fg && labelsMap[fg]) ? labelsMap[fg] : (fg || '—');
   const fgEl = document.getElementById('mFg');
   if (fgEl) { fgEl.title = fg; fgEl.classList.toggle('long', fg.length > 14); }
   const fgSub = document.getElementById('mFgSub');
-  if (fgSub) fgSub.textContent = fg && state.game === '1' ? '前台应用 · 游戏' : '前台应用';
+  if (fgSub) fgSub.textContent = fg && labelsMap[fg] ? fg : '前台应用';
 
   $('#stRunner').textContent = running ? '运行中' : '已停止';
   $('#stRunner').classList.toggle('on', running);
@@ -262,12 +264,39 @@ function render() {
   const map = {
     auto_game: state.cfg_auto_game, thread_opt: state.cfg_thread_opt,
     screen_off_saver: state.cfg_screen_off, kill_boost: state.cfg_kill_boost,
-    launch_boost: state.cfg_launch_boost, io_tune: state.cfg_io, gpu_tune: state.cfg_gpu
+    launch_boost: state.cfg_launch_boost, io_tune: state.cfg_io, gpu_tune: state.cfg_gpu,
+    charge_ctrl: state.cfg_charge_ctrl
   };
   $$('.switch input').forEach((el) => {
     const k = el.dataset.key;
     if (k in map && map[k] !== undefined) el.checked = map[k] === '1';
   });
+
+  // 充电状态：暂停 / 限流百分比 / 未接管
+  const chgEl = $('#chgState');
+  if (chgEl) {
+    const suspended = state.chg_suspend === '1';
+    const pct = parseInt(state.chg_last_pct || '-1', 10);
+    const soc = parseInt(state.battery || '0', 10);
+    const temp = parseInt(state.temp || '0', 10);
+    if (state.cfg_charge_ctrl !== '1') {
+      chgEl.textContent = '已关闭';
+      chgEl.classList.remove('on');
+      $('#chgSub').textContent = '不干预厂商充电曲线';
+    } else if (suspended) {
+      chgEl.textContent = '已暂停';
+      chgEl.classList.add('on');
+      $('#chgSub').textContent = `${soc}% · ${temp}℃ 达到温度墙`;
+    } else if (pct >= 0 && pct < 100) {
+      chgEl.textContent = pct + '%';
+      chgEl.classList.add('on');
+      $('#chgSub').textContent = `${soc}% · ${temp}℃ 限流中`;
+    } else {
+      chgEl.textContent = '全功率';
+      chgEl.classList.remove('on');
+      $('#chgSub').textContent = soc < 67 ? `${soc}% · 拐点前不干预` : `${soc}% · ${temp}℃`;
+    }
+  }
 
   const mode = state.cfg_mode || 'auto';
   $$('#modeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.mode === mode));
@@ -403,6 +432,25 @@ let appListCache = [];        // [{pkg, mode, game}]
 let appFilterKey = 'all';
 let sheetPkg = null;
 const MODE_CN = { follow: '跟随场景', game: '游戏', battery: '省电', daily: '日常', perf: '满血', custom: '自定义' };
+// 图标走 daemon 的 /icon（exec 通道下取不到，会退化成首字母色块）
+function iconSrc(pkg) {
+  return TRANSPORT === 'http' ? `${HTTP_BASE}/icon?p=${encodeURIComponent(pkg)}` : '';
+}
+
+let labelsMap = {};
+async function loadLabels() {
+  if (TRANSPORT === 'demo') {
+    labelsMap = { 'com.tencent.mm': '微信', 'com.tencent.tmgp.sgame': '王者荣耀' };
+    return;
+  }
+  const r = await api('labels');
+  labelsMap = {};
+  (r || '').split('\n').forEach((line) => {
+    const i = line.indexOf('=');
+    if (i > 0) labelsMap[line.slice(0, i)] = line.slice(i + 1);
+  });
+}
+
 const DEMO_APPS = [
   { pkg: 'com.tencent.tmgp.sgame', mode: 'game', game: true },
   { pkg: 'com.tencent.mm', mode: 'battery', game: false },
@@ -417,8 +465,11 @@ async function loadApps() {
   } else {
     const r = await api('apps');
     appListCache = (r || '').split('\n').map((x) => x.trim()).filter(Boolean).map((line) => {
-      const [pkg, mode, game] = line.split('|');
-      return { pkg, mode: !mode || mode === '-' ? 'follow' : mode, game: game === '1' };
+      const [pkg, mode, game, label] = line.split('|');
+      return {
+        pkg, mode: !mode || mode === '-' ? 'follow' : mode,
+        game: game === '1', label: label || '',
+      };
     });
   }
   renderRules(await readRules());
@@ -427,7 +478,9 @@ async function loadApps() {
 
 function renderApps() {
   const kw = ($('#appSearch').value || '').toLowerCase();
-  let list = appListCache.filter((a) => !kw || a.pkg.toLowerCase().includes(kw));
+  let list = appListCache.filter((a) => !kw
+    || a.pkg.toLowerCase().includes(kw)
+    || (a.label && a.label.toLowerCase().includes(kw)));
   if (appFilterKey === 'set') list = list.filter((a) => a.mode !== 'follow');
   if (appFilterKey === 'game') list = list.filter((a) => a.game || a.mode === 'game');
 
@@ -440,12 +493,17 @@ function renderApps() {
     return;
   }
   box.innerHTML = list.map((a) => {
-    const label = a.mode === 'follow' ? (a.game ? '游戏名单' : '跟随场景') : (MODE_CN[a.mode] || a.mode);
+    const modeText = a.mode === 'follow' ? (a.game ? '游戏名单' : '跟随场景') : (MODE_CN[a.mode] || a.mode);
+    const title = a.label || a.pkg.split('.').pop();
+    const initial = (a.label || a.pkg.replace(/^com\.|^cn\.|^net\./, '')).charAt(0).toUpperCase();
     return `
     <button class="row btn-row" data-pkg="${a.pkg}">
+      <span class="ico-wrap"><img class="ico" loading="lazy" alt=""
+        src="${iconSrc(a.pkg)}"
+        onerror="var w=this.parentNode;this.style.display='none';w.classList.add('ph')"><i class="ph-l">${initial}</i></span>
       <div class="row-main">
-        <span class="row-title">${a.pkg}</span>
-        <span class="row-sub">${label}</span>
+        <span class="row-title">${title}</span>
+        <span class="row-sub">${a.pkg} · ${modeText}</span>
       </div>
       <span class="chip ${a.mode === 'follow' ? '' : 'on'}">${a.mode === 'follow' ? '—' : (MODE_CN[a.mode] || a.mode)}</span>
     </button>`;
@@ -565,6 +623,7 @@ $('#btnRestore').addEventListener('click', async () => {
 $('#btnRetry')?.addEventListener('click', async () => {
   TRANSPORT = '';
   showBlocker(false);
+  await loadLabels();
   await refresh();
   if (TRANSPORT && TRANSPORT !== 'demo') toast('已连接：' + (TRANSPORT_CN[TRANSPORT] || TRANSPORT));
 });
@@ -578,6 +637,7 @@ $('#btnRetry')?.addEventListener('click', async () => {
   const qs = new URLSearchParams(location.search);
   if (qs.get('theme')) applyTheme(qs.get('theme'));
 
+  await loadLabels();
   await refresh();
 
   const tab = location.hash.replace('#', '') || qs.get('tab');

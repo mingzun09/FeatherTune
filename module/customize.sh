@@ -38,7 +38,7 @@ rm -f "$DATA/control.sock" "$DATA/stop" 2>/dev/null
 
 # --- 用户数据目录（升级不覆盖配置）---
 mkdir -p "$DATA" 2>/dev/null
-for f in config.ini games.conf rules.conf apps.conf; do
+for f in config.ini games.conf rules.conf apps.conf labels.conf; do
   if [ ! -f "$DATA/$f" ] && [ -f "$MODPATH/etc/$f" ]; then
     cp -f "$MODPATH/etc/$f" "$DATA/$f"
     ui_print "- 初始化配置: $f"

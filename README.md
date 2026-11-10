@@ -10,7 +10,7 @@
 - ROOT：KernelSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.2.5 · versionCode 10007 · C 静态守护进程（193 KB，零依赖）
+> v1.2.6 · versionCode 10008 · C 静态守护进程（193 KB，零依赖）
 
 ![首页](shots/1home-light.png)
 
@@ -67,7 +67,12 @@ v1.2 是单个静态 arm64 二进制（`bin/feather`）：1 Hz 轮询、热路�
 ### 应用管理（v1.2.5）
 
 WebUI 第二个 tab 从「游戏名单」升级成**应用管理**：直接读本机第三方应用列表（`pm list packages -3`），
-给任意应用单独指定策略——一旦指定就**脱离场景**（白名单语义），自动模式下也不会被改回去。
+每个应用显示**名称 + 图标 + 包名 + 当前策略**，可以给任意应用单独指定策略——一旦指定就**脱离场景**
+（白名单语义），自动模式下也不会被改回去。
+
+- **名称**：`labels.conf`（`包名=名称`），已内置 150+ 常见应用与游戏；你也可以自己加，改完刷新生效
+- **图标**：守护进程从 APK 里直接抠 `res/…ic_launcher*.png`（toybox 自带的 `unzip` 就够，不依赖任何工具），
+  缓存到 `/data/adb/feather/icons/`；取不到时退化成首字母色块
 
 | 选项 | 说明 |
 |---|---|
@@ -80,6 +85,25 @@ WebUI 第二个 tab 从「游戏名单」升级成**应用管理**：直接读�
 ```
 <包名> <模式> <性能簇上限%> <超大核上限%> <地板%> <线程规则0|1>
 com.netease.cloudmusic  custom 70 60 20 0
+```
+
+### 充电控制（v1.2.6）
+
+只做「少要一点电流」，**不碰温度上报、不改 DT**——所以零刷机风险，删模块即恢复。
+
+| 区间 | 行为 |
+|---|---|
+| SOC < 67% | **完全不干预**，让厂商曲线全功率跑（这段电池本身不热） |
+| SOC ≥ 67% | 按电池温度查表降电流上限：`36:100,38:85,40:70,42:50` |
+| 温度 ≥ 43℃ | 暂停充电；回落到 40℃ 再恢复 |
+
+- 作用点是充电 IC 的输入/恒流上限，**SVOOC / UFCS / PPS 三种协议同时生效**（都要经过这里）
+- 只能降不能升：系统因温度降了功率，我们没法加回去
+- 所有动过的节点在退出 / 卸载时还原成动手前的值
+- 配置项：`charge_ctrl` / `charge_knee_soc` / `charge_temp_wall` / `charge_resume_temp` / `charge_curve`
+
+```sh
+su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh charge probe'   # 看这台机器开放了哪个节点
 ```
 
 ### 线程规则（`rules.conf`）
@@ -135,7 +159,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.2.5.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.2.6.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -205,7 +229,7 @@ aarch64-linux-gnu-gcc -Os -s -static -Wno-format-truncation -Wno-unused-result \
   -o module/bin/feather src/feather.c
 
 # 端到端测试：假 /sys /proc /cgroup 树 + 真实 arm64 二进制（binfmt/qemu-user）
-FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 42 项
+FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 47 项
 
 # 打包
 python build.py
@@ -215,7 +239,7 @@ python build.py
 src/feather.c          单文件 C 守护进程（daemon + CLI + socket + HTTP + WebUI 托管）
 module/                Magisk/KSU/APatch 模块骨架（含 webroot/）
 module/bin/shell/      v1.0 的 shell 实现，仅作二进制跑不起来时的兜底
-tests/                 42 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
+tests/                 47 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
 docs/DESIGN.md         设计取舍、源码分析、每一轮实测复盘
 ```
 

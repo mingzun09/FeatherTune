@@ -143,6 +143,25 @@ check "超大核已压 < max"          '[ "${PR:-0}" -lt 4608000 ] && [ "${PR:-0
 check "退出游戏后 min 频还原"    'grep -qx 300000 "$FAKE/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"' "$(cat "$FAKE/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq")"
 check "后台 cpuset 还原"          'grep -qx "0-7" "$FAKE/sys/fs/cgroup/background/cpuset.cpus"' "$(cat "$FAKE/sys/fs/cgroup/background/cpuset.cpus")"
 
+echo "== 5.5 充电控制（方案 A）=="
+PS="$FAKE/sys/class/power_supply/battery"
+echo 70 > "$PS/capacity"; echo 390 > "$PS/temp"; echo Charging > "$PS/status"
+sleep 3
+CUR=$(cat "$PS/constant_charge_current_max")
+check "SOC>67 且 39℃ → 落到 85% 档" '[ "$CUR" -le 5200000 ] && [ "$CUR" -ge 4900000 ]' "cur=$CUR"
+echo 440 > "$PS/temp"
+sleep 3
+check "44℃ 到温度墙 → 暂停充电" 'grep -qx 1 "$PS/input_suspend"' "suspend=$(cat "$PS/input_suspend")"
+echo 400 > "$PS/temp"
+sleep 3
+check "回到 40℃ → 恢复充电" 'grep -qx 0 "$PS/input_suspend"' "suspend=$(cat "$PS/input_suspend")"
+echo 50 > "$PS/capacity"; echo 360 > "$PS/temp"
+sleep 3
+check "SOC<67 → 不干预(满电流)" 'grep -qx 6000000 "$PS/constant_charge_current_max"' "cur=$(cat "$PS/constant_charge_current_max")"
+echo Discharging > "$PS/status"
+sleep 2
+check "停止充电 → 还原原始电流" 'grep -qx 6000000 "$PS/constant_charge_current_max"' "cur=$(cat "$PS/constant_charge_current_max")"
+
 echo "== 6. 熄屏 =="
 printf '0\n' > "$FAKE/sys/class/backlight/panel0-backlight/brightness"
 sleep 5
