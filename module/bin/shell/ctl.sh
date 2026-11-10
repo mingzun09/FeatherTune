@@ -152,9 +152,9 @@ cmd_apps() {  # 给 WebUI 的已安装第三方应用列表
 
 cmd_ctl() {
     case "$1" in
-        start)   "$BIN_DIR/featherd.sh" start ;;
-        stop)    "$BIN_DIR/featherd.sh" stop ;;
-        restart) "$BIN_DIR/featherd.sh" stop; sleep 0.5; "$BIN_DIR/featherd.sh" start ;;
+        start)   "$BIN_DIR/featherd-daemon.sh" start ;;
+        stop)    "$BIN_DIR/featherd-daemon.sh" stop ;;
+        restart) "$BIN_DIR/featherd-daemon.sh" stop; sleep 0.5; "$BIN_DIR/featherd-daemon.sh" start ;;
         *) echo "err=usage" ;;
     esac
 }

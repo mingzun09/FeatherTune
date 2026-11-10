@@ -33,6 +33,7 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/prctl.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -41,8 +42,8 @@
 #define PATH_MAX 4096
 #endif
 
-#define APP_VER   "v1.2.4"
-#define APP_VC    10006
+#define APP_VER   "v1.2.5"
+#define APP_VC    10007
 #define MAX_FREQ  64
 #define MAX_POL   4
 #define MAX_RULES 64
@@ -53,7 +54,7 @@ static int g_http_port = 7891;   // 可由 FEATHER_HTTP_PORT 覆盖（测试隔�
 static char P_DATA[PATH_MAX], P_CPU[PATH_MAX], P_CGRP[PATH_MAX], P_CPUCTL[PATH_MAX],
             P_SYS[PATH_MAX],
             P_PROC[PATH_MAX], P_HM[PATH_MAX], P_CONF[PATH_MAX], P_GAMES[PATH_MAX],
-            P_RULES[PATH_MAX], P_STATE[PATH_MAX], P_LOG[PATH_MAX], P_PID[PATH_MAX],
+            P_RULES[PATH_MAX], P_APPS[PATH_MAX], P_STATE[PATH_MAX], P_LOG[PATH_MAX], P_PID[PATH_MAX],
             P_SOCK[PATH_MAX];
 static char g_cset_node[16] = "cpuset.cpus";   // cpuset v1 用 cpus，v2 用 cpuset.cpus
 
@@ -89,9 +90,10 @@ static void path_init(void) {
     snprintf(P_CONF, sizeof P_CONF, "%s/config.ini", P_DATA);
     snprintf(P_GAMES, sizeof P_GAMES, "%s/games.conf", P_DATA);
     snprintf(P_RULES, sizeof P_RULES, "%s/rules.conf", P_DATA);
+    snprintf(P_APPS, sizeof P_APPS, "%s/apps.conf", P_DATA);
     snprintf(P_STATE, sizeof P_STATE, "%s/state", P_DATA);
     snprintf(P_LOG, sizeof P_LOG, "%s/feather.log", P_DATA);
-    snprintf(P_PID, sizeof P_PID, "%s/featherd.pid", P_DATA);
+    snprintf(P_PID, sizeof P_PID, "%s/featherd-daemon.pid", P_DATA);
     snprintf(P_SOCK, sizeof P_SOCK, "%s/control.sock", P_DATA);
 }
 
@@ -1024,6 +1026,63 @@ static int foreground_pkg(char *out, size_t n) {
     return -1;
 }
 
+/* ------------------------------------------------------------ 应用级策略 --
+ * apps.conf 一行一个应用，用户可以在 WebUI 里给任意第三方应用指定策略，
+ * 一旦设定就脱离「场景」，按包名直接生效（白名单语义）。
+ *   <包名> <模式> <性能簇上限%> <超大核上限%> <地板%> <线程规则0|1>
+ * 模式：follow=跟随场景 / game / battery / daily / perf / custom
+ */
+#define MAX_APPS 128
+typedef struct {
+    char pkg[128];
+    char mode[16];
+    int  perf, prime, floor, threads;
+} apprule_t;
+static apprule_t g_apps[MAX_APPS];
+static int g_napps;
+static struct timespec g_apps_mtime;
+static const apprule_t *g_cur_app;      // 当前生效的应用规则（custom 时用它的百分比）
+
+static const apprule_t *app_find(const char *pkg) {
+    if (!pkg || !pkg[0]) return NULL;
+    for (int i = 0; i < g_napps; i++)
+        if (!strcmp(g_apps[i].pkg, pkg)) return &g_apps[i];
+    return NULL;
+}
+
+static void apps_load(void) {
+    struct stat st;
+    struct timespec mt = {0, 0};
+    if (stat(P_APPS, &st) == 0) {
+        mt.tv_sec = st.st_mtime;
+        mt.tv_nsec = st.st_mtim.tv_nsec;
+        if (timespec_eq(mt, g_apps_mtime) && g_apps_mtime.tv_sec != 0) return;
+    }
+    g_apps_mtime = mt;
+    g_napps = 0;
+    FILE *f = fopen(P_APPS, "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f) && g_napps < MAX_APPS) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = 0;
+        char pkg[128], mode[16];
+        int pp = 0, pr = 0, fl = 0, th = 0;
+        if (sscanf(line, "%127s %15s %d %d %d %d", pkg, mode, &pp, &pr, &fl, &th) < 2) continue;
+        if (!strcmp(mode, "follow")) continue;      // follow 等于没配置
+        apprule_t *a = &g_apps[g_napps];
+        snprintf(a->pkg, sizeof a->pkg, "%s", pkg);
+        snprintf(a->mode, sizeof a->mode, "%s", mode);
+        a->perf = pp > 0 ? pp : 100;
+        a->prime = pr > 0 ? pr : 100;
+        a->floor = fl;
+        a->threads = th;
+        g_napps++;
+    }
+    fclose(f);
+    logv("apps: 载入 %d 条应用策略", g_napps);
+}
+
 static char **g_games;
 static int g_ngames, g_games_cap;
 static struct timespec g_games_mtime;
@@ -1118,7 +1177,7 @@ static void battery_status(char *out, size_t n) {
 }
 
 // ------------------------------------------------------------------- rules --
-typedef struct { char pkg[128]; char pat[192]; regex_t re; int valid; const char *target; } rule_t;
+typedef struct { char pkg[128]; char pat[192]; char tgt[48]; regex_t re; int valid; const char *target; } rule_t;
 static rule_t g_rules[MAX_RULES];
 static int g_nrules;
 static struct timespec g_rules_mtime;
@@ -1181,7 +1240,18 @@ static void rules_load(void) {
         if (!*pat) continue;
         char pkg[128];
         snprintf(pkg, sizeof pkg, "%.*s", (int)(sp2 - st), st);
-        const char *mask = mask_of(tgt);
+        // 目标支持用 '+' 组合：核掩码 + hmbird 调度属性，例如
+        //   prime1+preempt     独占 CPU7，并标记为抢占优先
+        //   perf+uclamp:512    性能簇内，但 uclamp_max 压到 50%，不把频率顶上去
+        char tgt_buf[48], tgt_buf_orig[48];
+        snprintf(tgt_buf, sizeof tgt_buf, "%s", tgt);
+        snprintf(tgt_buf_orig, sizeof tgt_buf_orig, "%s", tgt);
+        const char *mask = NULL;
+        {
+            char *plus = strchr(tgt_buf, '+');
+            if (plus) { *plus = 0; mask = mask_of(tgt_buf); }
+            else mask = mask_of(tgt_buf);
+        }
         // 非核掩码目标：交给 hmbird 自己的调度属性（不进亲和性）
         if (!mask && (!strcmp(tgt, "preempt") || !strcmp(tgt, "idle"))) {
             rule_t *r0 = &g_rules[g_nrules];
@@ -1190,6 +1260,7 @@ static void rules_load(void) {
             snprintf(r0->pat, sizeof r0->pat, "%s", pat);
             if (regcomp(&r0->re, pat, REG_EXTENDED | REG_NOSUB) != 0) continue;
             r0->valid = 1;
+            snprintf(g_rules[g_nrules].pat, sizeof g_rules[g_nrules].pat, "%s", pat);
             r0->target = (tgt[0] == 'p') ? "preempt" : "idle";
             g_nrules++;
             continue;
@@ -1207,7 +1278,8 @@ static void rules_load(void) {
             continue;
         }
         r->valid = 1;
-        r->target = mask;
+        snprintf(r->tgt, sizeof r->tgt, "%s", tgt_buf_orig);
+        r->target = r->tgt;
         g_nrules++;
     }
     fclose(f);
@@ -1306,15 +1378,34 @@ static void apply_threads(long pid, const char *pkg) {
             }
         }
         if (target) {
-            if (!strcmp(target, "preempt") || !strcmp(target, "idle")) {
-                char node[PATH_MAX], v[32];
-                snprintf(node, sizeof node, "%s/prefer_%s", P_HM, target);
-                snprintf(v, sizeof v, "%ld 1", tid);
-                if (wrp(node, v) == 0) { g_schedprop_pinned++; added++; }
-            } else {
-                pin_tid(tid, target);
-                added++;
+            char parts[64];
+            snprintf(parts, sizeof parts, "%s", target);
+            int pinned_any = 0;
+            char *save = NULL;
+            for (char *t = strtok_r(parts, "+", &save); t; t = strtok_r(NULL, "+", &save)) {
+                if (!strncmp(t, "uclamp:", 7)) {
+                    char node[PATH_MAX], v[48];
+                    int val = atoi(t + 7);
+                    if (val < 1) val = 1;
+                    if (val > 1024) val = 1024;
+                    snprintf(node, sizeof node, "%s/set_uclamp", P_HM);
+                    snprintf(v, sizeof v, "%ld %d", tid, val);
+                    if (wrp(node, v) == 0) g_schedprop_pinned++;
+                    else if (g_log_level >= 2) logv("uclamp: %ld 写入失败 (%s)", tid, t);
+                    continue;
+                }
+                if (!strcmp(t, "preempt") || !strcmp(t, "idle")) {
+                    char node[PATH_MAX], v[32];
+                    snprintf(node, sizeof node, "%s/prefer_%s", P_HM, t);
+                    snprintf(v, sizeof v, "%ld 1", tid);
+                    if (wrp(node, v) == 0) g_schedprop_pinned++;
+                    continue;
+                }
+                const char *m = mask_of(t);
+                if (!m && !strncmp(t, "0x", 2)) m = t;      // 规则里可能直接写掩码
+                if (m) { pin_tid(tid, m); pinned_any = 1; }
             }
+            if (pinned_any || target[0]) added++;
         }
     }
     closedir(d);
@@ -1331,6 +1422,7 @@ static long g_cap_perf, g_cap_prime;
 static void apply_profile(const char *name) {
     int pp, pr;
     profile_pct(name, &pp, &pr);
+    if (!strcmp(name, "custom") && g_cur_app) { pp = g_cur_app->perf; pr = g_cur_app->prime; }
     if (pp < 100 && idx_perf >= 0) g_cap_perf = set_cap(idx_perf, pp);
     else g_cap_perf = policy_cap_now(idx_perf);
     if (pr < 100 && idx_prime >= 0) g_cap_prime = set_cap(idx_prime, pr);
@@ -1343,6 +1435,11 @@ static void apply_profile(const char *name) {
     set_uclamp("top-app", top);
     set_uclamp("system-background", bg + 10);
 
+    if (!strcmp(name, "custom") && g_cur_app && g_cur_app->floor > 0 && idx_perf >= 0) {
+        long t = pol[idx_perf].max / 100 * g_cur_app->floor;
+        set_policy_min(idx_perf, freq_ge(&pol[idx_perf], t));
+        if (!g_game_extras) g_game_extras = 1;    // 借用同一套还原逻辑
+    }
     if (!strcmp(name, "game")) {
         hmbird_apply_game();
         apply_game_extras();
@@ -1386,6 +1483,13 @@ static void decide_now(char *want, size_t n, char *fg_out, size_t fgn) {
     if (!screen_on()) { snprintf(want, n, "sleep"); return; }
     char fg[256] = "";
     if (foreground_pkg(fg, sizeof fg) == 0 && fg[0] && fg_out) snprintf(fg_out, fgn, "%s", fg);
+    // 应用级策略优先于场景：用户设了就是白名单，不受 auto/手动模式限制
+    const apprule_t *ar = app_find(fg);
+    g_cur_app = ar;
+    if (ar) {
+        snprintf(want, n, "%s", ar->mode);
+        return;
+    }
     if (strcmp(C.mode, "auto")) { snprintf(want, n, "%s", C.mode); return; }
     if (C.auto_game && is_game(fg)) { snprintf(want, n, "game"); return; }
     long b = battery_cap();
@@ -1619,7 +1723,9 @@ static void cmd_doctor(char *out, size_t n) {
 // 运行一条命令（daemon 与本地 CLI 共用）
 static void run_cmd(const char *line, char *out, size_t n) {
     char cmd[64] = "", a1[128] = "", a2[128] = "", a3[128] = "";
-    int got = sscanf(line, "%63s %127s %127s %127s", cmd, a1, a2, a3);
+    char a4[64] = "", a5[64] = "", a6[64] = "", a7[64] = "";
+    int got = sscanf(line, "%63s %127s %127s %127s %63s %63s %63s %63s",
+                     cmd, a1, a2, a3, a4, a5, a6, a7);
     if (got <= 0) { snprintf(out, n, "err=empty\n"); return; }
 
     cfg_load();
@@ -1630,6 +1736,7 @@ static void run_cmd(const char *line, char *out, size_t n) {
     hmbird_detect();
     games_load();
     rules_load();
+    apps_load();
 
     if (!strcmp(cmd, "status")) { cmd_status(out, n); return; }
     if (!strcmp(cmd, "doctor")) { cmd_doctor(out, n); return; }
@@ -1693,15 +1800,6 @@ static void run_cmd(const char *line, char *out, size_t n) {
         snprintf(out, n, "err=usage\n");
         return;
     }
-    if (!strcmp(cmd, "apps")) {
-        FILE *p = popen("pm list packages -3 2>/dev/null | sed 's/^package://'", "r");
-        if (!p) { snprintf(out, n, "err=pm\n"); return; }
-        size_t off = 0;
-        out[0] = 0;
-        while (off + 128 < n && fgets(out + off, (int)(n - off), p)) off = strlen(out);
-        pclose(p);
-        return;
-    }
     if (!strcmp(cmd, "set") && got >= 3) {
         if (cfg_set(a1, a2) != 0) { snprintf(out, n, "err=write\n"); return; }
         apply_now(out, n);
@@ -1714,6 +1812,132 @@ static void run_cmd(const char *line, char *out, size_t n) {
         if (!valid) { snprintf(out, n, "err=bad_mode\n"); return; }
         cfg_set("mode", a1);
         apply_now(out, n);
+        return;
+    }
+    if (!strcmp(cmd, "apps") || !strcmp(cmd, "app")) {
+        if (got >= 2 && !strcmp(a1, "set") && got >= 3) {
+            // app set <pkg> <mode> [perf prime floor threads]
+            const char *pkg = a2;
+            const char *mode = got >= 4 ? a3 : "custom";
+            int pp = got >= 5 ? atoi_safe(a4, 100) : 100;
+            int pr = got >= 6 ? atoi_safe(a5, 100) : 100;
+            int fl = got >= 7 ? atoi_safe(a6, 0) : 0;
+            int th = got >= 8 ? atoi_safe(a7, 1) : 1;
+            if (pp < 20) pp = 20;
+            if (pp > 100) pp = 100;
+            if (pr < 20) pr = 20;
+            if (pr > 100) pr = 100;
+            if (fl < 0) fl = 0;
+            if (fl > 95) fl = 95;
+            char tmp[PATH_MAX];
+            snprintf(tmp, sizeof tmp, "%s/.a.tmp", P_DATA);
+            FILE *in = fopen(P_APPS, "r"), *o = fopen(tmp, "w");
+            int wrote = 0;
+            if (o) {
+                if (in) {
+                    char b[512];
+                    while (fgets(b, sizeof b, in)) {
+                        char c[512];
+                        snprintf(c, sizeof c, "%s", b);
+                        char *t = c;
+                        while (*t == ' ' || *t == '\t') t++;
+                        char *sp = strpbrk(t, " \t\r\n");
+                        if (sp) *sp = 0;
+                        if (!strcmp(t, pkg)) continue;      // 旧行丢掉，末尾重写
+                        fputs(b, o);
+                    }
+                    fclose(in);
+                }
+                fprintf(o, "%s %s %d %d %d %d\n", pkg, mode, pp, pr, fl, th);
+                fclose(o);
+                wrote = 1;
+            }
+            if (wrote) {
+                rename(tmp, P_APPS);
+                g_apps_mtime.tv_sec = 0;
+                g_apps_mtime.tv_nsec = 0;
+                apps_load();
+                snprintf(out, n, "ok=app:%s mode=%s perf=%d prime=%d floor=%d thr=%d\n",
+                         pkg, mode, pp, pr, fl, th);
+            } else {
+                snprintf(out, n, "err=write_failed\n");
+            }
+            return;
+        }
+        if (got >= 2 && !strcmp(a1, "del") && got >= 3) {
+            char tmp[PATH_MAX];
+            snprintf(tmp, sizeof tmp, "%s/.a.tmp", P_DATA);
+            FILE *in = fopen(P_APPS, "r"), *o = fopen(tmp, "w");
+            if (in && o) {
+                char b[512];
+                while (fgets(b, sizeof b, in)) {
+                    char c[512];
+                    snprintf(c, sizeof c, "%s", b);
+                    char *t = c;
+                    while (*t == ' ' || *t == '\t') t++;
+                    char *sp = strpbrk(t, " \t\r\n");
+                    if (sp) *sp = 0;
+                    if (!strcmp(t, a2)) continue;
+                    fputs(b, o);
+                }
+                fclose(in);
+                fclose(o);
+                rename(tmp, P_APPS);
+                g_apps_mtime.tv_sec = 0;
+                apps_load();
+                snprintf(out, n, "ok=deleted:%s\n", a2);
+            } else {
+                if (in) fclose(in);
+                snprintf(out, n, "err=write_failed\n");
+            }
+            return;
+        }
+        // apps [list]：本机第三方应用 + 它们的策略（结果缓存 60s，pm 本身要 0.3~0.6s）
+        static char cache[16384];
+        static long cache_ts;
+        long now2 = (long)time(NULL);
+        if (!cache[0] || now2 - cache_ts > 60) {
+            FILE *pp2 = popen("pm list packages -3 2>/dev/null | sed 's/^package://'", "r");
+            size_t off = 0;
+            cache[0] = 0;
+            if (pp2) {
+                char ln[256];
+                while (fgets(ln, sizeof ln, pp2) && off + 200 < sizeof cache) {
+                    char *nl = strchr(ln, '\n');
+                    if (nl) *nl = 0;
+                    if (!ln[0]) continue;
+                    const apprule_t *ar = app_find(ln);
+                    off += (size_t)snprintf(cache + off, sizeof cache - off, "%s|%s|%d\n",
+                                            ln, ar ? ar->mode : "-", is_game(ln) ? 1 : 0);
+                }
+                pclose(pp2);
+                cache_ts = now2;
+            }
+            // pm 读不到（SELinux 限制 / 非 Android 环境）时，至少把已配置的应用列出来，
+            // 否则 WebUI 会是一片空白，用户连自己配过什么都看不到
+            if (!cache[0]) {
+                size_t off2 = 0;
+                for (int i = 0; i < g_napps && off2 + 200 < sizeof cache; i++)
+                    off2 += (size_t)snprintf(cache + off2, sizeof cache - off2, "%s|%s|%d\n",
+                                             g_apps[i].pkg, g_apps[i].mode,
+                                             is_game(g_apps[i].pkg) ? 1 : 0);
+                for (int i = 0; i < g_ngames && off2 + 200 < sizeof cache; i++) {
+                    if (app_find(g_games[i])) continue;
+                    off2 += (size_t)snprintf(cache + off2, sizeof cache - off2, "%s|%s|1\n",
+                                             g_games[i], "follow");
+                }
+            }
+        }
+        snprintf(out, n, "%s", cache);
+        return;
+    }
+    if (!strcmp(cmd, "apprule")) {
+        size_t off = 0;
+        out[0] = 0;
+        for (int i = 0; i < g_napps && off + 200 < n; i++)
+            off += (size_t)snprintf(out + off, n - off, "%s|%s|%d|%d|%d|%d\n",
+                                    g_apps[i].pkg, g_apps[i].mode, g_apps[i].perf,
+                                    g_apps[i].prime, g_apps[i].floor, g_apps[i].threads);
         return;
     }
     if (!strcmp(cmd, "version")) { snprintf(out, n, "%s (%d)\n", APP_VER, APP_VC); return; }
@@ -1894,6 +2118,35 @@ static void http_handle(int fd, char *outbuf, size_t outsz) {
         } else snprintf(cmd, sizeof cmd, "err=missing_pkg");
     } else if (!strcmp(path, "/apps")) {
         snprintf(cmd, sizeof cmd, "apps");
+    } else if (!strcmp(path, "/app")) {
+        char op[16] = "", pk[128] = "", m[20] = "custom";
+        int va = 100, vb = 100, vc = 0, vd = 1;
+        char *q2 = query;
+        while (q2 && *q2) {
+            char *amp = strchr(q2, '&');
+            char kv[256];
+            size_t len = amp ? (size_t)(amp - q2) : strlen(q2);
+            if (len >= sizeof kv) len = sizeof kv - 1;
+            memcpy(kv, q2, len);
+            kv[len] = 0;
+            char *eq = strchr(kv, '=');
+            if (eq) {
+                *eq = 0;
+                char *v = eq + 1;
+                url_decode(v);
+                if (!strcmp(kv, "op")) snprintf(op, sizeof op, "%s", v);
+                else if (!strcmp(kv, "p")) snprintf(pk, sizeof pk, "%s", v);
+                else if (!strcmp(kv, "m")) snprintf(m, sizeof m, "%s", v);
+                else if (!strcmp(kv, "a")) va = atoi(v);
+                else if (!strcmp(kv, "b")) vb = atoi(v);
+                else if (!strcmp(kv, "c")) vc = atoi(v);
+                else if (!strcmp(kv, "d")) vd = atoi(v);
+            }
+            q2 = amp ? amp + 1 : NULL;
+        }
+        if (!pk[0]) snprintf(cmd, sizeof cmd, "err=missing_pkg");
+        else if (!strcmp(op, "del")) snprintf(cmd, sizeof cmd, "app del %s", pk);
+        else snprintf(cmd, sizeof cmd, "app set %s %s %d %d %d %d", pk, m, va, vb, vc, vd);
     } else if (!strcmp(path, "/rules")) {
         FILE *f = fopen(P_RULES, "r");
         if (!f) { http_reply(fd, "", "text/plain; charset=utf-8"); close(fd); return; }
@@ -2053,6 +2306,7 @@ static int run_daemon(void) {
         }
 
         bool changed = cfg_load();
+        apps_load();
         if (!C.enable) {
             if (cur[0]) { restore_all(); cur[0] = 0; }
             continue;
@@ -2064,8 +2318,13 @@ static int run_daemon(void) {
         char want[16] = "";
         decide_now(want, sizeof want, fg, sizeof fg);
         if (scr && fg[0] && strcmp(fg, last_fg)) {
+            logmsg("app: 检测到切换软件 %s -> %s", last_fg[0] ? last_fg : "(无)", fg);
             snprintf(last_fg, sizeof last_fg, "%s", fg);
-            if (C.launch_boost) burst_until = now + C.boost_ms / 1000;
+            if (C.launch_boost) {
+                burst_until = now + C.boost_ms / 1000;
+                logmsg("app: 临时还原频率上限与调度参数 %dms（%ld%%/%ld%%，期间不压 uclamp）",
+                       C.boost_ms, 100L, 92L);
+            }
         }
         if (!scr) last_fg[0] = 0;
         if (tick % 5 == 0) {
@@ -2086,7 +2345,12 @@ static int run_daemon(void) {
         if (strcmp(C.mode, "auto")) need = 1;
 
         if ((strcmp(cand, cur) && cand_n >= need) || (cur[0] && changed)) {
+            const char *why = strcmp(cand, cur) ? "场景切换" : "配置变更";
+            char prev[16];
+            snprintf(prev, sizeof prev, "%s", cur[0] ? cur : "-");
             apply_profile(cand);
+            logmsg("switch: %s -> %s  因%s (fg=%s, %d 拍确认, 上限 %ld/%ld)",
+                   prev, cand, why, last_fg[0] ? last_fg : "-", cand_n, g_cap_perf, g_cap_prime);
             snprintf(cur, sizeof cur, "%s", cand);
             if (strcmp(cur, "game")) { g_seen_pid = -1; g_nseen = 0; }
         }
@@ -2234,6 +2498,8 @@ static int cli_main(int argc, char **argv, char *outbuf, size_t outsz) {
 }
 
 int main(int argc, char **argv) {
+    // ps 里显示成 featherd-daemon，而不是含义模糊的 feather
+    prctl(PR_SET_NAME, "featherd-daemon", 0, 0, 0);
     path_init();
     read_buildprops();
     static char outbuf[65536];

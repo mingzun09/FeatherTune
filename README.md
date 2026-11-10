@@ -10,7 +10,7 @@
 - ROOT：KernelSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.2.4 · versionCode 10006 · C 静态守护进程（193 KB，零依赖）
+> v1.2.5 · versionCode 10007 · C 静态守护进程（193 KB，零依赖）
 
 ![首页](shots/1home-light.png)
 
@@ -64,12 +64,33 @@ v1.2 是单个静态 arm64 二进制（`bin/feather`）：1 Hz 轮询、热路�
 扩到 `task_cpu_possible_mask`，多核 `taskset` 基本无效；只有「单核掩码」会被尊重。所以规则的降级顺序是
 `prefer_cluster → prefer_cpu → 单核亲和 → 多核亲和`，单核目标直接走 `prefer_cpu`。
 
+### 应用管理（v1.2.5）
+
+WebUI 第二个 tab 从「游戏名单」升级成**应用管理**：直接读本机第三方应用列表（`pm list packages -3`），
+给任意应用单独指定策略——一旦指定就**脱离场景**（白名单语义），自动模式下也不会被改回去。
+
+| 选项 | 说明 |
+|---|---|
+| 跟随场景 | 等于没配置（从 `apps.conf` 里删掉） |
+| 游戏 / 省电 | 直接用内置档位 |
+| 自定义 | 性能簇上限、超大核上限、频率地板、是否套用线程归位规则 |
+
+配置落盘在 `/data/adb/feather/apps.conf`：
+
+```
+<包名> <模式> <性能簇上限%> <超大核上限%> <地板%> <线程规则0|1>
+com.netease.cloudmusic  custom 70 60 20 0
+```
+
 ### 线程规则（`rules.conf`）
 
 ```
 <包名|*>  <线程名 POSIX ERE>  <目标>
 目标： prime=CPU6-7  prime1=CPU7  prime2=CPU6  perf=CPU0-5  mid=CPU4-5  low=CPU0-3  bg=CPU0-1
 ```
+
+目标可以用 `+` 组合核掩码与 hmbird 调度属性：`prime1+preempt`、`perf+uclamp:640`、`low+idle`。
+`preempt` = 抢占优先（延迟敏感），`idle` = 偏好空闲核，`uclamp:N` = per-task uclamp_max（1024=100%）。
 
 三个坑（都踩过，写进注释了）：
 
@@ -114,7 +135,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.2.4.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.2.5.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -184,7 +205,7 @@ aarch64-linux-gnu-gcc -Os -s -static -Wno-format-truncation -Wno-unused-result \
   -o module/bin/feather src/feather.c
 
 # 端到端测试：假 /sys /proc /cgroup 树 + 真实 arm64 二进制（binfmt/qemu-user）
-FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 40 项
+FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 42 项
 
 # 打包
 python build.py
@@ -194,7 +215,7 @@ python build.py
 src/feather.c          单文件 C 守护进程（daemon + CLI + socket + HTTP + WebUI 托管）
 module/                Magisk/KSU/APatch 模块骨架（含 webroot/）
 module/bin/shell/      v1.0 的 shell 实现，仅作二进制跑不起来时的兜底
-tests/                 40 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
+tests/                 42 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
 docs/DESIGN.md         设计取舍、源码分析、每一轮实测复盘
 ```
 

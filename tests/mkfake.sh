@@ -52,6 +52,9 @@ mkf "$H/heavy_boost" "0 400 140"
 mkf "$H/prefer_cpu" ""
 mkf "$H/freq_policy" "0,0"
 mkf "$H/prefer_cluster" ""
+mkf "$H/prefer_preempt" ""
+mkf "$H/prefer_idle" ""
+mkf "$H/set_uclamp" ""
 
 # ---------------- cgroup v2
 for g in top-app foreground background system-background; do

@@ -85,6 +85,10 @@ function httpMap(cmd) {
   if (cmd === 'restore') return '/restore';
   if (cmd === 'pkg list') return '/games';
   if (cmd === 'apps') return '/apps';
+  if (cmd.startsWith('app ')) return '/app?' + cmd.slice(4).split(/\s+/)
+      .map((v, i) => (i === 0 ? 'op=' : i === 1 ? 'p=' : i === 2 ? 'm=' : i === 3 ? 'a=' : i === 4 ? 'b=' : i === 5 ? 'c=' : 'd=') + q(v))
+      .join('&');
+  if (cmd === 'apps') return '/apps';
   if (cmd.startsWith('log')) return '/log?n=' + (cmd.split(/\s+/)[1] || 60);
   if (cmd.startsWith('pkg add ')) return '/games/add?p=' + q(cmd.slice(8).trim());
   if (cmd.startsWith('pkg del ')) return '/games/del?p=' + q(cmd.slice(8).trim());
@@ -103,7 +107,9 @@ async function api(cmd) {
   if (TRANSPORT === 'http') {
     const m = httpMap(cmd);
     if (!m) return null;
-    return httpGet(m);
+    // apps/doctor/log 在真机上要跑 pm/dumpsys，1.6s 会超时（qemu 下更慢）
+    const slow = m.startsWith('/apps') || m.startsWith('/doctor') || m.startsWith('/log');
+    return httpGet(m, slow ? 8000 : 1600);
   }
   return null;
 }
@@ -232,12 +238,12 @@ function render() {
   $('#mBattery').textContent = state.battery ? state.battery + '%' : '—';
   $('#mTemp').textContent    = state.temp ? state.temp + '°C' : '—';
   const fg = state.fg || '';
-  let fgShort = '';
-  if (fg) {
-    fgShort = fg.split('.').slice(-2).join('.');
-    if (fgShort.length > 11) fgShort = fgShort.slice(-11);
-  }
-  $('#mFg').textContent = fg ? fgShort : (state.game === '1' ? '游戏中' : '—');
+  // 完整包名，不再截断（手机上一行放不下就换行，见 .metric b 的样式）
+  $('#mFg').textContent = fg || '—';
+  const fgEl = document.getElementById('mFg');
+  if (fgEl) { fgEl.title = fg; fgEl.classList.toggle('long', fg.length > 14); }
+  const fgSub = document.getElementById('mFgSub');
+  if (fgSub) fgSub.textContent = fg && state.game === '1' ? '前台应用 · 游戏' : '前台应用';
 
   $('#stRunner').textContent = running ? '运行中' : '已停止';
   $('#stRunner').classList.toggle('on', running);
@@ -346,16 +352,16 @@ function showTab(name) {
   $$('.tab').forEach((t) => t.classList.add('hidden'));
   const p = $('#tab-' + name);
   if (p) p.classList.remove('hidden');
-  if (name === 'game') kickGames();
+  if (name === 'apps') kickApps();
 }
 
 /* 游戏页依赖通道，早期打开时先等探测完成 */
-async function kickGames() {
+async function kickApps() {
   if (!TRANSPORT && !DEMO) {
     const t = await probe();
-    if (!t) { $('#gameCount').textContent = '通道未连接'; return; }
+    if (!t) { $('#appCount').textContent = '通道未连接'; return; }
   }
-  await loadGames();
+  await loadApps();
 }
 $$('.tabbtn').forEach((b) => {
   b.addEventListener('click', () => {
@@ -366,7 +372,6 @@ $$('.tabbtn').forEach((b) => {
 
 /* --------------------------------------------------------------------- 游戏 */
 let gamesCache = [];
-let appsCache = null;
 let pickMode = false;
 
 function renderRules(text) {
@@ -393,79 +398,135 @@ async function readRules() {
   return r || '';
 }
 
-async function loadGames() {
+/* ------------------------------------------------------------ 应用管理 ---- */
+let appListCache = [];        // [{pkg, mode, game}]
+let appFilterKey = 'all';
+let sheetPkg = null;
+const MODE_CN = { follow: '跟随场景', game: '游戏', battery: '省电', daily: '日常', perf: '满血', custom: '自定义' };
+const DEMO_APPS = [
+  { pkg: 'com.tencent.tmgp.sgame', mode: 'game', game: true },
+  { pkg: 'com.tencent.mm', mode: 'battery', game: false },
+  { pkg: 'com.netease.cloudmusic', mode: 'custom', game: false },
+  { pkg: 'com.bilibili.app.in', mode: 'follow', game: false },
+  { pkg: 'com.taobao.taobao', mode: 'follow', game: false },
+];
+
+async function loadApps() {
   if (TRANSPORT === 'demo') {
-    gamesCache = MOCK_GAMES.slice();
-    renderRules(MOCK_RULES);
+    appListCache = DEMO_APPS.slice();
   } else {
-    const r = await api('pkg list');
-    gamesCache = (r || '').split('\n').map((s) => s.trim()).filter(Boolean);
-    renderRules(await readRules());
+    const r = await api('apps');
+    appListCache = (r || '').split('\n').map((x) => x.trim()).filter(Boolean).map((line) => {
+      const [pkg, mode, game] = line.split('|');
+      return { pkg, mode: !mode || mode === '-' ? 'follow' : mode, game: game === '1' };
+    });
   }
-  $('#gameCount').textContent = `${gamesCache.length} 个应用`;
-  renderGames();
+  renderRules(await readRules());
+  renderApps();
 }
 
-function renderGames() {
-  const q = ($('#gameSearch').value || '').toLowerCase();
-  const list = pickMode ? (appsCache || []).filter((p) => !gamesCache.includes(p)) : gamesCache;
-  const shown = list.filter((p) => p.toLowerCase().includes(q));
+function renderApps() {
+  const kw = ($('#appSearch').value || '').toLowerCase();
+  let list = appListCache.filter((a) => !kw || a.pkg.toLowerCase().includes(kw));
+  if (appFilterKey === 'set') list = list.filter((a) => a.mode !== 'follow');
+  if (appFilterKey === 'game') list = list.filter((a) => a.game || a.mode === 'game');
 
-  const box = $('#gameList');
-  if (!shown.length) {
-    box.innerHTML = `<div class="empty">${pickMode ? '没有可添加的应用' : '名单为空，点右上角添加'}</div>`;
+  const configured = appListCache.filter((a) => a.mode !== 'follow' || a.game).length;
+  $('#appCount').textContent = `${configured} 个已配置 / 共 ${appListCache.length} 个应用`;
+
+  const box = $('#appList');
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">没有匹配的应用</div>';
     return;
   }
-  box.innerHTML = shown.map((p) => `
-    <div class="row">
-      <div class="row-main"><span class="row-title">${p}</span></div>
-      ${pickMode
-        ? `<button class="add" data-add="${p}" aria-label="添加"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>`
-        : `<button class="del" data-del="${p}" aria-label="删除"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>`}
-    </div>`).join('');
+  box.innerHTML = list.map((a) => {
+    const label = a.mode === 'follow' ? (a.game ? '游戏名单' : '跟随场景') : (MODE_CN[a.mode] || a.mode);
+    return `
+    <button class="row btn-row" data-pkg="${a.pkg}">
+      <div class="row-main">
+        <span class="row-title">${a.pkg}</span>
+        <span class="row-sub">${label}</span>
+      </div>
+      <span class="chip ${a.mode === 'follow' ? '' : 'on'}">${a.mode === 'follow' ? '—' : (MODE_CN[a.mode] || a.mode)}</span>
+    </button>`;
+  }).join('');
 
-  box.querySelectorAll('[data-del]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const pkg = btn.dataset.del;
-      await api(`pkg del ${pkg}`);
-      gamesCache = gamesCache.filter((x) => x !== pkg);
-      if (appsCache) appsCache.push(pkg);
-      renderGames();
-      $('#gameCount').textContent = `${gamesCache.length} 个应用`;
-      toast('已移出名单');
-    });
-  });
-  box.querySelectorAll('[data-add]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const pkg = btn.dataset.add;
-      await api(`pkg add ${pkg}`);
-      gamesCache.push(pkg);
-      renderGames();
-      $('#gameCount').textContent = `${gamesCache.length} 个应用`;
-      toast('已加入名单');
-    });
+  box.querySelectorAll('[data-pkg]').forEach((btn) => {
+    btn.addEventListener('click', () => openSheet(btn.dataset.pkg));
   });
 }
-$('#gameSearch').addEventListener('input', renderGames);
 
-$('#addGameBtn').addEventListener('click', async () => {
-  if (!pickMode) {
-    if (TRANSPORT === 'demo') {
-      appsCache = ['com.tencent.mm', 'com.taobao.taobao', 'com.netease.cloudmusic',
-        'com.tencent.tmgp.pubgmhd', 'com.bilibili.app.in'];
-    } else {
-      const r = await api('apps');
-      appsCache = (r || '').split('\n').map((s) => s.trim()).filter(Boolean);
-      if (!appsCache.length) { toast('读不到应用列表（通道受限）'); }
-    }
-    pickMode = true;
-    $('#addGameBtn').textContent = '完成';
-    $('#gameSearchWrap').classList.remove('hidden');
-  } else {
-    pickMode = false;
-    $('#addGameBtn').textContent = '添加应用';
-  }
-  renderGames();
+// ---- 底部弹层
+function openSheet(pkg) {
+  sheetPkg = pkg;
+  const rec = appListCache.find((a) => a.pkg === pkg) || { pkg, mode: 'follow' };
+  $('#sheetPkg').textContent = pkg;
+  setSheetMode(rec.mode === 'follow' && rec.game ? 'game' : rec.mode);
+  $('#appSheet').classList.remove('hidden');
+}
+
+function setSheetMode(mode) {
+  const btns = $('#sheetMode').querySelectorAll('button');
+  btns.forEach((b) => b.classList.toggle('on', b.dataset.m === mode));
+  $('#sheetMode').dataset.cur = mode;
+  $('#sheetCustom').classList.toggle('hidden', mode !== 'custom');
+}
+
+async function saveApp(pkg, mode, perf, prime, floor, threads) {
+  if (TRANSPORT === 'demo') return;
+  if (mode === 'follow') await api(`app del ${pkg}`);
+  else await api(`app set ${pkg} ${mode} ${perf} ${prime} ${floor} ${threads ? 1 : 0}`);
+}
+
+$('#appSearch').addEventListener('input', renderApps);
+$('#appFilter').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  appFilterKey = b.dataset.f;
+  $('#appFilter').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+  renderApps();
+});
+$('#appRefresh').addEventListener('click', async () => {
+  $('#appRefresh').textContent = '刷新中';
+  await loadApps();
+  $('#appRefresh').textContent = '刷新';
+  toast('已刷新');
+});
+
+$('#sheetMode').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (b) setSheetMode(b.dataset.m);
+});
+
+['sPerf', 'sPrime', 'sFloor'].forEach((id) => {
+  const el = document.getElementById(id);
+  el.addEventListener('input', () => {
+    document.getElementById(id === 'sPerf' ? 'vPerf' : id === 'sPrime' ? 'vPrime' : 'vFloor').textContent = el.value + '%';
+  });
+});
+
+$('#sheetClose').addEventListener('click', async () => {
+  const mode = $('#sheetMode').dataset.cur || 'follow';
+  await saveApp(sheetPkg, mode,
+    +$('#sPerf').value, +$('#sPrime').value, +$('#sFloor').value, $('#sThreads').checked);
+  const rec = appListCache.find((a) => a.pkg === sheetPkg);
+  if (rec) rec.mode = mode;
+  $('#appSheet').classList.add('hidden');
+  renderApps();
+  toast(mode === 'follow' ? '已恢复跟随场景' : '已保存');
+});
+
+$('#sheetReset').addEventListener('click', async () => {
+  await saveApp(sheetPkg, 'follow', 100, 100, 0, 1);
+  const rec = appListCache.find((a) => a.pkg === sheetPkg);
+  if (rec) rec.mode = 'follow';
+  $('#appSheet').classList.add('hidden');
+  renderApps();
+  toast('已恢复跟随场景');
+});
+
+$('#appSheet').addEventListener('click', (e) => {
+  if (e.target.id === 'appSheet') $('#appSheet').classList.add('hidden');
 });
 
 /* -------------------------------------------------------------------- 设置 */

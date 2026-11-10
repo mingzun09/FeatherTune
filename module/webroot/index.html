@@ -67,7 +67,7 @@
       </div>
       <div class="metric card">
         <svg class="mi" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8"/></svg>
-        <b id="mFg">—</b><span>前台应用</span>
+        <b id="mFg">—</b><span id="mFgSub">前台应用</span>
       </div>
     </div>
 
@@ -163,21 +163,29 @@
   </section>
 
   <!-- ================= 游戏 ================= -->
-  <section class="tab hidden" id="tab-game">
+  <section class="tab hidden" id="tab-apps">
     <div class="card game-head">
       <div>
-        <span class="row-title">已加入游戏名单</span>
-        <p class="hint" id="gameCount">— 个应用</p>
+        <span class="row-title">应用管理</span>
+        <p class="hint" id="appCount">—</p>
       </div>
-      <button class="text-btn" id="addGameBtn">添加应用</button>
+      <button class="text-btn" id="appRefresh">刷新</button>
     </div>
 
-    <div class="searchbar" id="gameSearchWrap">
+    <div class="searchbar">
       <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-      <input id="gameSearch" placeholder="搜索包名">
+      <input id="appSearch" placeholder="搜索应用包名">
     </div>
 
-    <div class="group card list" id="gameList"></div>
+    <div class="segwrap">
+      <div class="seg" id="appFilter">
+        <button class="on" data-f="all">全部</button>
+        <button data-f="set">已配置</button>
+        <button data-f="game">游戏</button>
+      </div>
+    </div>
+
+    <div class="group card list" id="appList"></div>
 
     <div class="section-title">线程归位规则</div>
     <div class="card codebox">
@@ -185,9 +193,50 @@
     </div>
     <div class="card note">
       <svg viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4"/><circle cx="12" cy="12" r="3"/></svg>
-      <p>hmbird 激活时会把任务核掩码扩大，普通绑核会被它覆盖，因此这里优先写 hmbird 的 <code>prefer_cpu</code>；未被接管时才回落到 taskset。</p>
+      <p>给任意应用单独指定策略后，它就不再受场景（自动识别/手动模式）影响——相当于白名单。选「跟随场景」即可恢复自动。</p>
     </div>
   </section>
+
+  <!-- 应用策略底部弹层 -->
+  <div class="sheet hidden" id="appSheet">
+    <div class="sheet-card">
+      <div class="sheet-head">
+        <b id="sheetPkg">—</b>
+        <button class="text-btn" id="sheetClose">完成</button>
+      </div>
+
+      <div class="seg" id="sheetMode">
+        <button data-m="follow">跟随场景</button>
+        <button data-m="game">游戏</button>
+        <button data-m="battery">省电</button>
+        <button data-m="custom">自定义</button>
+      </div>
+
+      <div id="sheetCustom" class="hidden">
+        <div class="slider">
+          <div class="lab"><span>性能簇上限</span><b id="vPerf">100%</b></div>
+          <input type="range" id="sPerf" min="30" max="100" step="1" value="100">
+        </div>
+        <div class="slider">
+          <div class="lab"><span>超大核上限</span><b id="vPrime">100%</b></div>
+          <input type="range" id="sPrime" min="30" max="100" step="1" value="100">
+        </div>
+        <div class="slider">
+          <div class="lab"><span>频率地板</span><b id="vFloor">0%</b></div>
+          <input type="range" id="sFloor" min="0" max="80" step="1" value="0">
+        </div>
+        <div class="row" style="padding:14px 0 0">
+          <div class="row-main"><span class="row-title">套用线程归位规则</span><span class="row-sub">按 rules.conf 给该应用分核</span></div>
+          <label class="switch"><input type="checkbox" id="sThreads" checked><i></i></label>
+        </div>
+      </div>
+
+      <div class="row" style="padding:14px 0 0">
+        <div class="row-main"><span class="row-sub">改动立即生效，不需要重启守护进程</span></div>
+        <button class="text-btn" id="sheetReset">恢复跟随</button>
+      </div>
+    </div>
+  </div>
 
   <!-- ================= 设置 ================= -->
   <section class="tab hidden" id="tab-settings">
@@ -202,7 +251,7 @@
 
     <div class="section-title">关于</div>
     <div class="card about">
-      <p><b>羽量调校 FeatherTune v1.2.1</b></p>
+      <p><b>羽量调校 FeatherTune v1.2.5</b></p>
       <p class="hint">面向 OnePlus 15 / SM8850 的场景化功耗调校。C 守护进程常驻（1Hz，零 fork），日常按负载收紧频率上限并压制厂商 boost；游戏场景与 Oplus 风驰协同，接管线程归位与调速器系数。</p>
       <p class="hint">兼容 Android 15–17 · KernelSU / Magisk / APatch · 元模块环境<br>WebUI 双通道：内核接口 / <code>http://127.0.0.1:7891/</code></p>
     </div>
@@ -216,8 +265,8 @@
     <button class="tabbtn" data-tab="scene">
       <svg viewBox="0 0 24 24"><path d="M4 17c3-6 5-9 8-9s5 3 8 9"/><path d="M4 20h16"/></svg><span>场景</span>
     </button>
-    <button class="tabbtn" data-tab="game">
-      <svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="4"/><path d="M8 10v4M6 12h4M16 11h.01M18 13h.01"/></svg><span>游戏</span>
+    <button class="tabbtn" data-tab="apps">
+      <svg viewBox="0 0 24 24"><rect x="3" y="4" width="7" height="7" rx="2"/><rect x="14" y="4" width="7" height="7" rx="2"/><rect x="3" y="15" width="7" height="7" rx="2"/><rect x="14" y="15" width="7" height="7" rx="2"/></svg><span>应用</span>
     </button>
     <button class="tabbtn" data-tab="settings">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2 2M16.4 16.4l2 2M18.4 5.6l-2 2M7.6 16.4l-2 2"/></svg><span>设置</span>

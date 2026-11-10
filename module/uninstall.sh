@@ -6,14 +6,14 @@ BIN=/data/adb/modules/$MODID/bin
 
 if [ -x "$BIN/feather" ]; then
   "$BIN/feather" stop >/dev/null 2>&1
-elif [ -x "$BIN/shell/featherd.sh" ]; then
-  "$BIN/shell/featherd.sh" stop >/dev/null 2>&1
+elif [ -x "$BIN/shell/featherd-daemon.sh" ]; then
+  "$BIN/shell/featherd-daemon.sh" stop >/dev/null 2>&1
 fi
 
-if [ -f "$DATA/featherd.pid" ]; then
-  kill "$(cat "$DATA/featherd.pid" 2>/dev/null)" 2>/dev/null
+if [ -f "$DATA/featherd-daemon.pid" ]; then
+  kill "$(cat "$DATA/featherd-daemon.pid" 2>/dev/null)" 2>/dev/null
 fi
-rm -f "$DATA/stop" "$DATA/featherd.pid" "$DATA/control.sock" 2>/dev/null
+rm -f "$DATA/stop" "$DATA/featherd-daemon.pid" "$DATA/control.sock" 2>/dev/null
 
 for p in /sys/devices/system/cpu/cpufreq/policy*; do
   [ -d "$p" ] || continue

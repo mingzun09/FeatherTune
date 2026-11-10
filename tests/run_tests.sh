@@ -55,7 +55,7 @@ out=$(sh -c ". '$BIN/lib.sh'; detect_topology; set_cap \"\$PRIME_POLICY\" 62")
 check "62% 上限 -> 2854400 档" '[ "$out" = "2854400" ] || [ "$out" = "2880000" ] || [ "$out" = "2611200" ]' "got=$out"
 
 echo "== 3. 守护进程：游戏场景 =="
-sh "$BIN/featherd.sh" run >/dev/null 2>&1 &
+sh "$BIN/featherd-daemon.sh" run >/dev/null 2>&1 &
 DPID=$!
 sleep 4
 S=$(cat "$DATA/state" 2>/dev/null)

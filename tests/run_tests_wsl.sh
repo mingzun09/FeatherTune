@@ -69,6 +69,8 @@ check "游戏不压频"                'echo "$S" | grep -qx "cap_perf=3628800"'
 check "frame_per_sec 对齐刷新率"  'grep -qx 165 "$FAKE/proc/sys/hmbird_II/frame_per_sec"' "$(cat "$FAKE/proc/sys/hmbird_II/frame_per_sec")"
 check "主线程钉 CPU7(prefer_cpu 0x80)"   'grep -q "prefer_cpu <- .* 0x80" "$DATA/wr.trace"' "$(grep prefer_cpu "$DATA/wr.trace" 2>/dev/null | head -2)"
 check "图形设备钉 CPU6(prefer_cpu 0x40)" 'grep -q "prefer_cpu <- .* 0x40" "$DATA/wr.trace"' "$(grep prefer_cpu "$DATA/wr.trace" 2>/dev/null | tail -2)"
+check "串行链标记 preempt"        'grep -q "prefer_preempt <- [0-9]* 1" "$DATA/wr.trace"' "$(grep prefer_preempt "$DATA/wr.trace" 2>/dev/null | head -2)"
+check "并行 Job 压 uclamp"        'grep -q "set_uclamp <- [0-9]* 640" "$DATA/wr.trace"' "$(grep set_uclamp "$DATA/wr.trace" 2>/dev/null | head -2)"
 check "音频走 prefer_cluster(性能簇)"     'grep -q "prefer_cluster <- .* 0x1" "$DATA/wr.trace"' ""
 check "perf 簇抬底频(>=1.5G)"     '[ "$(cat "$FAKE/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq")" -ge 1305600 ]' "$(cat "$FAKE/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq")"
 check "后台 cpuset 收窄 0-3"      'grep -qx "0-3" "$FAKE/sys/fs/cgroup/background/cpuset.cpus"' "$(cat "$FAKE/sys/fs/cgroup/background/cpuset.cpus")"
@@ -151,7 +153,7 @@ check "熄屏上限 <= 30%"           '[ "${PF:-9}" -le 1305600 ]' "cap_perf=$PF
 printf '120\n' > "$FAKE/sys/class/backlight/panel0-backlight/brightness"
 
 echo "== 7. 停止与还原 =="
-echo "  [debug] runner=$("$BIN" status 2>/dev/null | sed -n 's/^runner=//p') pidfile=$(cat "$DATA/featherd.pid" 2>/dev/null)"
+echo "  [debug] runner=$("$BIN" status 2>/dev/null | sed -n 's/^runner=//p') pidfile=$(cat "$DATA/featherd-daemon.pid" 2>/dev/null)"
 "$BIN" stop >/dev/null 2>&1
 sleep 1
 kill $DPID 2>/dev/null

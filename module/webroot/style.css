@@ -131,6 +131,10 @@ html[data-theme="dark"] .pill.off{color:#ff6961}
 .metric b{font-size:17px;font-weight:600;letter-spacing:-.3px;
           white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;display:block}
 .metric span{font-size:11px;color:var(--sub)}
+/* 前台包名要完整显示：允许换行、最多两行，绝不用省略号截断 */
+#mFg{font-size:12px;line-height:1.25;letter-spacing:0;white-space:normal;word-break:break-all;
+     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.metric b.long{font-size:12px}
 
 /* ----------------------------------------------------------------- rows -- */
 .group{padding:4px 0;margin-bottom:2px}
@@ -268,3 +272,33 @@ html[data-theme="dark"] .tag.t-game{color:#ffb340}
 /* 让 sticky tabbar 生效需要内容撑满 */
 .tab{display:flex;flex-direction:column}
 .tab.hidden{display:none}
+
+
+/* ---------------------------------------------------------- 应用管理/弹层 -- */
+.chip{font-size:11px;padding:3px 9px;border-radius:999px;background:rgba(120,120,128,.16);
+      color:var(--sub);white-space:nowrap}
+.chip.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.sheet{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-end;justify-content:center;
+       background:rgba(0,0,0,.34);animation:fade .16s ease}
+.sheet.hidden{display:none}
+.sheet-card{width:100%;max-width:430px;background:var(--card);border-radius:26px 26px 0 0;
+            padding:18px 18px calc(20px + env(safe-area-inset-bottom));
+            box-shadow:0 -12px 40px rgba(0,0,0,.22);
+            animation:sheetUp .26s cubic-bezier(.2,.9,.2,1)}
+@keyframes sheetUp{from{transform:translateY(28px);opacity:.5}to{transform:none;opacity:1}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+.sheet-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+.sheet-head b{font-size:13px;font-weight:600;word-break:break-all;line-height:1.35}
+.slider{margin-top:16px}
+.slider .lab{display:flex;justify-content:space-between;align-items:baseline;font-size:13px}
+.slider .lab span{color:var(--sub)}
+.slider .lab b{font-size:13px;font-variant-numeric:tabular-nums}
+.slider input[type=range]{-webkit-appearance:none;width:100%;height:28px;background:transparent;margin:2px 0 0}
+.slider input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:2px;
+      background:rgba(120,120,128,.28)}
+.slider input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;
+      margin-top:-8px;border-radius:50%;background:var(--accent);
+      box-shadow:0 1px 5px rgba(0,0,0,.28);transition:transform .12s ease}
+.slider input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
+#appSheet .row{padding:0;min-height:auto}
+.empty{padding:22px 16px;text-align:center;color:var(--sub);font-size:13px}

@@ -18,7 +18,7 @@ GAMES=$DATA/games.conf
 RULES=$DATA/rules.conf
 STATE=$DATA/state
 LOG=$DATA/feather.log
-PIDFILE=$DATA/featherd.pid
+PIDFILE=$DATA/featherd-daemon.pid
 
 CPU=${FEATHER_CPU_ROOT:-/sys/devices/system/cpu}
 CGRP=${FEATHER_CGROUP_ROOT:-/sys/fs/cgroup}

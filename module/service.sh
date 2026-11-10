@@ -13,7 +13,7 @@ while [ $i -lt 30 ]; do
 done
 
 # 兜底：老版本残留的 shell 守护进程先清掉
-if [ -f "$DATA/featherd.pid" ] && [ ! -x "$BIN/feather" ]; then
+if [ -f "$DATA/featherd-daemon.pid" ] && [ ! -x "$BIN/feather" ]; then
   : # 交给 shell 版自己判断
 fi
 
@@ -22,5 +22,5 @@ if [ -x "$BIN/feather" ]; then
   exit 0
 fi
 
-[ -x "$BIN/shell/featherd.sh" ] && "$BIN/shell/featherd.sh" start
+[ -x "$BIN/shell/featherd-daemon.sh" ] && "$BIN/shell/featherd-daemon.sh" start
 exit 0

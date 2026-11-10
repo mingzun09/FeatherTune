@@ -30,15 +30,15 @@ set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 [ -d "$MODPATH/webroot" ] && set_perm_recursive "$MODPATH/webroot" 0 0 0755 0644
 
 # --- 停掉旧实例（v1.0 shell 版 / 旧二进制）---
-if [ -f "$DATA/featherd.pid" ]; then
-  kill "$(cat "$DATA/featherd.pid" 2>/dev/null)" 2>/dev/null
-  rm -f "$DATA/featherd.pid"
+if [ -f "$DATA/featherd-daemon.pid" ]; then
+  kill "$(cat "$DATA/featherd-daemon.pid" 2>/dev/null)" 2>/dev/null
+  rm -f "$DATA/featherd-daemon.pid"
 fi
 rm -f "$DATA/control.sock" "$DATA/stop" 2>/dev/null
 
 # --- 用户数据目录（升级不覆盖配置）---
 mkdir -p "$DATA" 2>/dev/null
-for f in config.ini games.conf rules.conf; do
+for f in config.ini games.conf rules.conf apps.conf; do
   if [ ! -f "$DATA/$f" ] && [ -f "$MODPATH/etc/$f" ]; then
     cp -f "$MODPATH/etc/$f" "$DATA/$f"
     ui_print "- 初始化配置: $f"
