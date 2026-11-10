@@ -25,7 +25,12 @@ if [ -x "$BIN/feather" ]; then
   (
     while true; do
       "$BIN/feather" run >/dev/null 2>&1
-      echo "[$(date '+%m-%d %H:%M:%S')] supervisor: 守护进程退出，2s 后重启" >> "$DATA/feather.log"
+      rc=$?
+      if [ "$rc" = "3" ]; then
+        echo "[$(date '+%m-%d %H:%M:%S')] supervisor: 已有实例在跑，退出看护" >> "$DATA/feather.log"
+        break
+      fi
+      echo "[$(date '+%m-%d %H:%M:%S')] supervisor: 守护进程退出(rc=$rc)，2s 后重启" >> "$DATA/feather.log"
       sleep 2
     done
     rmdir "$LOCKDIR" 2>/dev/null

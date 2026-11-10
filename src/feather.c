@@ -49,7 +49,8 @@
 #define MAX_POL   4
 #define MAX_RULES 64
 #define MAX_SEEN  2048
-static int g_http_port = 7891;   // 可由 FEATHER_HTTP_PORT 覆盖（测试隔离端口）
+static int g_http_port = 7891;
+static int g_http_errno;         // 最近一次 bind/listen 失败原因   // 可由 FEATHER_HTTP_PORT 覆盖（测试隔离端口）
 
 // ------------------------------------------------------------------ paths --
 static char P_DATA[PATH_MAX], P_CPU[PATH_MAX], P_CGRP[PATH_MAX], P_CPUCTL[PATH_MAX],
@@ -922,6 +923,15 @@ static int hmbird_live(void) {
 
 static int g_pm_errno;      // 最近一次 prefer_* 写入的 errno（0=成功）
 
+// 带超时的 popen：把命令交给 timeout(1)（toybox 自带）跑，超时就杀掉，
+// 这样 pclose/读管道一定会返回。secs<=0 表示不包 timeout。
+static FILE *popen_t(const char *cmd, int secs) {
+    if (secs <= 0) return popen(cmd, "r");
+    char buf[2048];
+    snprintf(buf, sizeof buf, "timeout %d %s", secs, cmd);
+    return popen(buf, "r");
+}
+
 static void hm_write(const char *node, const char *val) {
     char path[PATH_MAX];
     snprintf(path, sizeof path, "%s/%s", P_HM, node);
@@ -1149,7 +1159,7 @@ static int is_ime_pkg(const char *pkg) {
 
 static void load_ime(void) {
     if (g_ime_pkg[0]) return;
-    FILE *pp = popen("settings get secure default_input_method 2>/dev/null", "r");
+    FILE *pp = popen_t("settings get secure default_input_method 2>/dev/null", 3);
     if (!pp) return;
     char line[256] = "";
     if (fgets(line, sizeof line, pp)) {
@@ -1225,7 +1235,7 @@ static int pkg_from_line(const char *line, char *out, size_t n) {
 }
 
 static int fg_from_cmd(char *out, size_t n, const char *cmd) {
-    FILE *pp = popen(cmd, "r");
+    FILE *pp = popen_t(cmd, 4);
     if (!pp) return -1;
     char line[512];
     int ok = -1;
@@ -1506,7 +1516,18 @@ static int icon_path(const char *pkg, char *out, size_t n) {
         "%s -p \"$apk\" \"$e\" > %s 2>/dev/null",
         pkg, g_unzip, g_unzip, tmp);
 
-    int rc = system(cmd);
+    // icon 的命令是复合脚本（含 $var / 管道），不能直接前缀 timeout，
+    // 先落成临时脚本再用 timeout 包住整段，避免 pm/unzip 卡死拖住守护进程。
+    char script[PATH_MAX];
+    snprintf(script, sizeof script, "%s/.icon.sh", P_DATA);
+    FILE *sf = fopen(script, "w");
+    if (!sf) return -1;
+    fprintf(sf, "#!/system/bin/sh\n%s\n", cmd);
+    fclose(sf);
+    chmod(script, 0700);
+    char timed[PATH_MAX + 32];
+    snprintf(timed, sizeof timed, "timeout 8 sh %s >/dev/null 2>&1", script);
+    int rc = system(timed);
     if (rc != 0) {
         logv("icon: %s 抠取失败 (rc=%d, 工具=%s)", pkg, rc, g_unzip);
         icon_mark_miss(pkg);
@@ -2366,7 +2387,7 @@ static void run_cmd(const char *line, char *out, size_t n) {
         static long cache_ts;
         long now2 = (long)time(NULL);
         if (!cache[0] || now2 - cache_ts > 60) {
-            FILE *pp2 = popen("pm list packages -3 2>/dev/null | sed 's/^package://'", "r");
+            FILE *pp2 = popen_t("pm list packages -3 2>/dev/null | sed 's/^package://'", 8);
             size_t off = 0;
             cache[0] = 0;
             if (pp2) {
@@ -2537,10 +2558,17 @@ static int sock_listen(void) {
     unlink(P_SOCK);
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
-    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(fd, 8) != 0) {
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        g_http_errno = errno;
         close(fd);
         return -1;
     }
+    if (listen(fd, 8) != 0) {
+        g_http_errno = errno;
+        close(fd);
+        return -1;
+    }
+    g_http_errno = 0;
     chmod(P_SOCK, 0666);
     return fd;
 }
@@ -2860,7 +2888,11 @@ static int run_daemon(void) {
 
     int lsock = sock_listen();
     int hsock = http_listen();
-    if (hsock < 0) logmsg("http: 端口 %d 绑定失败，WebUI 只能走 ksu.exec", g_http_port);
+    if (hsock < 0)
+        logmsg("http: 端口 %d 绑定失败 errno=%d（WebUI 暂走 ksu.exec，稍后自动重试）",
+               g_http_port, g_http_errno);
+    else
+        logmsg("http: 已监听 127.0.0.1:%d", g_http_port);
     pid_t self = getpid();
     FILE *pf = fopen(P_PID, "w");
     if (pf) { fprintf(pf, "%d\n", (int)self); fclose(pf); }
@@ -2894,6 +2926,13 @@ static int run_daemon(void) {
             (void)served;   // 不 continue：让本拍继续走完同步与落盘
         }
         if (g_stop) break;
+
+        // HTTP 绑定失败后定期重试：被杀掉的旧连接会留下 TIME_WAIT，
+        // 启动那一刻 bind 可能被挡住，过一会儿就恢复了。
+        if (hsock < 0 && (tick % 15) == 7) {
+            hsock = http_listen();
+            if (hsock >= 0) logmsg("http: 重试成功，已监听 127.0.0.1:%d", g_http_port);
+        }
 
         // 命令里刚应用过 profile：立即同步状态，UI 不用等下一拍
         if (g_applied[0]) {
