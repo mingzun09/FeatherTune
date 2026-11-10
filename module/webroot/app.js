@@ -298,6 +298,9 @@ function render() {
     }
   }
 
+  const gm = state.cfg_game_mode || 'official';
+  $$('#gameModeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.gm === gm));
+
   const mode = state.cfg_mode || 'auto';
   $$('#modeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.mode === mode));
 
@@ -344,6 +347,19 @@ $$('.switch input').forEach((el) => {
       toast('设置失败');
     }
     setTimeout(refresh, 600);
+  });
+});
+
+/* ------------------------------------------------------- 游戏档策略分段 ---- */
+$$('#gameModeSeg button').forEach((b) => {
+  b.addEventListener('click', async () => {
+    $$('#gameModeSeg button').forEach((x) => x.classList.remove('on'));
+    b.classList.add('on');
+    const gm = b.dataset.gm;
+    const r = await api(`set game_mode ${gm}`);
+    if (r === null || /^err=/m.test(r || '')) { toast('设置失败'); return; }
+    toast(gm === 'official' ? '已交给系统' : gm === 'light' ? '轻量模式' : '激进模式');
+    setTimeout(refresh, 500);
   });
 });
 
@@ -432,9 +448,10 @@ let appListCache = [];        // [{pkg, mode, game}]
 let appFilterKey = 'all';
 let sheetPkg = null;
 const MODE_CN = { follow: '跟随场景', game: '游戏', battery: '省电', daily: '日常', perf: '满血', custom: '自定义' };
-// 图标走 daemon 的 /icon（exec 通道下取不到，会退化成首字母色块）
+// 图标统一走 daemon 的本机端口：KSU WebUI 里页面不是 daemon 提供的，
+// 但 127.0.0.1:7891 仍然可达（daemon 自己开了 CORS），这样 exec 通道也能显示图标
 function iconSrc(pkg) {
-  return TRANSPORT === 'http' ? `${HTTP_BASE}/icon?p=${encodeURIComponent(pkg)}` : '';
+  return `${HTTP_BASE}/icon?p=${encodeURIComponent(pkg)}`;
 }
 
 let labelsMap = {};

@@ -29,6 +29,8 @@ sh "$HERE/mkfake.sh" "$FAKE" >/dev/null || exit 1
 rm -rf "$DATA"; mkdir -p "$DATA"
 cp "$PROJ/module/etc/config.ini" "$PROJ/module/etc/games.conf" "$PROJ/module/etc/rules.conf" "$DATA/"
 sed -i 's/^log_level=.*/log_level=2/' "$DATA/config.ini"
+# 测试主体跑 aggressive（覆盖地板/绑核/uclamp 这些机制），official 另起一节验证
+grep -q '^game_mode=' "$DATA/config.ini" && sed -i 's/^game_mode=.*/game_mode=aggressive/' "$DATA/config.ini" || echo 'game_mode=aggressive' >> "$DATA/config.ini"
 echo "com.test.game" >> "$DATA/games.conf"
 
 export FEATHER_DATA="$DATA"
@@ -185,6 +187,14 @@ check "SOC 70% 39℃ → 曲线 88%"  '[ "$CUR" -ge 5200000 ] && [ "$CUR" -le 53
 echo Discharging > "$PS/status"
 sleep 2
 check "停止充电 → 还原原始电流" 'grep -qx 6000000 "$PS/constant_charge_current_max"' "cur=$(cat "$PS/constant_charge_current_max")"
+
+echo "== 5.6 official 模式：还权给系统 =="
+"$BIN" set game_mode official >/dev/null 2>&1
+sleep 3
+check "official: 频率地板已撤销"  'grep -qx 300000 "$FAKE/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"' "min=$(cat "$FAKE/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq")"
+check "official: 后台 cpuset 已还原" 'grep -qx "0-7" "$FAKE/sys/fs/cgroup/background/cpuset.cpus"' "cpus=$(cat "$FAKE/sys/fs/cgroup/background/cpuset.cpus")"
+check "official: hmbird 参数已按原值还原" 'grep -q "hmbird: 已还原" "$DATA/feather.log"' "$(grep -c "hmbird" "$DATA/feather.log")"
+"$BIN" set game_mode aggressive >/dev/null 2>&1
 
 echo "== 6. 熄屏 =="
 printf '0\n' > "$FAKE/sys/class/backlight/panel0-backlight/brightness"

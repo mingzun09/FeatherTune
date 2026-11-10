@@ -42,8 +42,8 @@
 #define PATH_MAX 4096
 #endif
 
-#define APP_VER   "v1.2.7"
-#define APP_VC    10009
+#define APP_VER   "v1.2.8"
+#define APP_VC    10010
 #define MAX_FREQ  64
 #define MAX_POL   4
 #define MAX_RULES 64
@@ -291,6 +291,7 @@ typedef struct {
     char mode[16];
     char hm_coeff[48], hm_high[48], hm_heavy[64];
     int  charge_ctrl, charge_knee_soc, charge_temp_wall, charge_resume_temp;
+    char game_mode[16];     // official / light / aggressive
     char chg_curve[128];
 } cfg_t;
 
@@ -448,6 +449,7 @@ static void cfg_defaults(void) {
     snprintf(C.hm_coeff, sizeof C.hm_coeff, "1152,1024");
     snprintf(C.hm_high, sizeof C.hm_high, "56,60");
     snprintf(C.hm_heavy, sizeof C.hm_heavy, "0,360,128");
+    snprintf(C.game_mode, sizeof C.game_mode, "official");
     C.charge_ctrl = 1; C.charge_knee_soc = 67; C.charge_temp_wall = 50;
     C.charge_resume_temp = 45;
     snprintf(C.chg_curve, sizeof C.chg_curve, "36:100,38:88,40:78,42:66,44:55,50:50");
@@ -517,6 +519,7 @@ static bool cfg_load(void) {   // 返回 true 表示内容有更新
         else if (!strcmp(key, "hmbird_coeff")) snprintf(C.hm_coeff, sizeof C.hm_coeff, "%s", val);
         else if (!strcmp(key, "hmbird_high_ratio")) snprintf(C.hm_high, sizeof C.hm_high, "%s", val);
         else if (!strcmp(key, "hmbird_heavy")) snprintf(C.hm_heavy, sizeof C.hm_heavy, "%s", val);
+        else if (!strcmp(key, "game_mode")) snprintf(C.game_mode, sizeof C.game_mode, "%s", val);
         else if (!strcmp(key, "charge_ctrl")) C.charge_ctrl = atoi_safe(val, 1);
         else if (!strcmp(key, "charge_knee_soc")) C.charge_knee_soc = atoi_safe(val, 67);
         else if (!strcmp(key, "charge_temp_wall")) C.charge_temp_wall = atoi_safe(val, 43);
@@ -896,28 +899,68 @@ static void hm_write(const char *node, const char *val) {
     wrp(path, val);
 }
 
+// 只写帧预算，不碰系数/地板
+/* hmbird 的每个参数在写之前都把原值存下来，退出/切模式时按原值还原。
+ * 之前是还原成硬编码的猜测值（1024,1024 / 0 400 140），等于把厂商调好的
+ * 协同值直接覆盖掉——这是错的。 */
+#define HM_SAVE_MAX 8
+typedef struct { char node[32]; char val[128]; } hmsave_t;
+static hmsave_t g_hb_save[HM_SAVE_MAX];
+static int g_hb_nsave;
+
+static void hm_save_once(const char *node) {
+    for (int i = 0; i < g_hb_nsave; i++)
+        if (!strcmp(g_hb_save[i].node, node)) return;
+    if (g_hb_nsave >= HM_SAVE_MAX) return;
+    char p[PATH_MAX], v[128];
+    snprintf(p, sizeof p, "%s/%s", P_HM, node);
+    if (rdline(p, v, sizeof v) != 0) return;
+    snprintf(g_hb_save[g_hb_nsave].node, sizeof g_hb_save[0].node, "%s", node);
+    snprintf(g_hb_save[g_hb_nsave].val, sizeof g_hb_save[0].val, "%s", v);
+    g_hb_nsave++;
+}
+
+// 写 hmbird 参数（带原值保存）
+static void hm_write_keep(const char *node, const char *val) {
+    hm_save_once(node);
+    hm_write(node, val);
+}
+
+static void hmbird_apply_frame_only(void) {
+    if (!g_hb_present) return;
+    if (C.hmbird_frame < 0) return;
+    int fps = C.hmbird_frame > 0 ? C.hmbird_frame : g_refresh;
+    if (fps <= 0) return;
+    char v[16], p[PATH_MAX];
+    snprintf(v, sizeof v, "%d", fps);
+    snprintf(p, sizeof p, "%s/frame_per_sec", P_HM);
+    hm_save_once("frame_per_sec");
+    if (wrverify(p, v) == 0) logv("hmbird: frame_per_sec=%d（light 模式，其余不动）", fps);
+}
+
 static void hmbird_apply_game(void) {
     if (!g_hb_present) return;
     // 帧率窗口对齐：跟面板刷新率一致，hmbird 的帧预算才算得准（纯收益，不受 hmbird_tune 影响）
     if (C.hmbird_frame >= 0) {
         int fps = C.hmbird_frame > 0 ? C.hmbird_frame : g_refresh;
         if (fps > 0) {
-            char v[16];
+            char v[16], fp[PATH_MAX];
             snprintf(v, sizeof v, "%d", fps);
-            if (wrverify(({ static char _p[PATH_MAX]; snprintf(_p, sizeof _p, "%s/frame_per_sec", P_HM); _p; }), v) == 0)
-                logv("hmbird: frame_per_sec=%d", fps);
+            snprintf(fp, sizeof fp, "%s/frame_per_sec", P_HM);
+            hm_save_once("frame_per_sec");
+            if (wrverify(fp, v) == 0) logv("hmbird: frame_per_sec=%d", fps);
         }
     }
     if (!C.hmbird_tune) return;
     char heavy[64];
     snprintf(heavy, sizeof heavy, "%s", C.hm_heavy);
     for (char *p = heavy; *p; p++) if (*p == ',') *p = ' ';
-    hm_write("coefficient", C.hm_coeff);
-    hm_write("perf_high_ratio", C.hm_high);
+    hm_write_keep("coefficient", C.hm_coeff);
+    hm_write_keep("perf_high_ratio", C.hm_high);
     char res[16];
     snprintf(res, sizeof res, "%d", C.hmbird_reserved);
-    hm_write("cpus_reserved", res);
-    hm_write("heavy_boost", heavy);
+    hm_write_keep("cpus_reserved", res);
+    hm_write_keep("heavy_boost", heavy);
     for (int i = 0; i < npol; i++) {
         char p[PATH_MAX];
         snprintf(p, sizeof p, "%s/hmbird/target_loads", pol[i].path);
@@ -930,18 +973,15 @@ static void hmbird_apply_game(void) {
 }
 
 static void hmbird_restore(void) {
-    if (!g_hb_present) return;
-    hm_write("coefficient", "1024,1024");
-    hm_write("perf_high_ratio", "60,60");
-    hm_write("cpus_reserved", "240");
-    hm_write("heavy_boost", "0 400 140");
-    for (int i = 0; i < npol; i++) {
+    if (!g_hb_present) { g_hb_nsave = 0; g_hb_tuned = 0; return; }
+    if (!g_hb_nsave) { g_hb_tuned = 0; return; }
+    for (int i = 0; i < g_hb_nsave; i++) {
         char p[PATH_MAX];
-        snprintf(p, sizeof p, "%s/hmbird/target_loads", pol[i].path);
-        wrp(p, "90");
-        snprintf(p, sizeof p, "%s/hmbird/apply_freq_immediately", pol[i].path);
-        wrp(p, "1");
+        snprintf(p, sizeof p, "%s/%s", P_HM, g_hb_save[i].node);
+        wrp(p, g_hb_save[i].val);
     }
+    logv("hmbird: 已还原 %d 个参数", g_hb_nsave);
+    g_hb_nsave = 0;
     g_hb_tuned = 0;
 }
 
@@ -1367,26 +1407,87 @@ static int pkg_ok(const char *pkg) {
 }
 
 // 把 APK 里的图标抠出来；成功返回 0 并写 out 路径
+//
+// Android 上没装 unzip 的机器不少，所以这里按 unzip → busybox unzip → toybox unzip
+// 依次降级（只探测一次）。选图标的规则也换掉了原来的「路径最长」——那是瞎猜，
+// 改成：优先 ic_launcher 命中的、按未压缩大小取最大的那个（xxxhdpi 通常最大）。
+static char g_unzip[64];        // "" = 一个都没有
+static int  g_unzip_probed;
+
+static void unzip_probe(void) {
+    if (g_unzip_probed) return;
+    g_unzip_probed = 1;
+    if (system("command -v unzip >/dev/null 2>&1") == 0) snprintf(g_unzip, sizeof g_unzip, "unzip");
+    else if (system("command -v busybox >/dev/null 2>&1") == 0) snprintf(g_unzip, sizeof g_unzip, "busybox unzip");
+    else if (system("command -v toybox >/dev/null 2>&1") == 0) snprintf(g_unzip, sizeof g_unzip, "toybox unzip");
+    else g_unzip[0] = 0;
+    logv("icon: 解压工具 = %s", g_unzip[0] ? g_unzip : "（无）");
+}
+
+static int icon_missed(const char *pkg) {
+    char mf[PATH_MAX];
+    snprintf(mf, sizeof mf, "%s/.miss", P_ICONS);
+    FILE *f = fopen(mf, "r");
+    if (!f) return 0;
+    char line[160];
+    int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = 0;
+        if (!strcmp(line, pkg)) { found = 1; break; }
+    }
+    fclose(f);
+    return found;
+}
+
+static void icon_mark_miss(const char *pkg) {
+    char mf[PATH_MAX];
+    snprintf(mf, sizeof mf, "%s/.miss", P_ICONS);
+    FILE *f = fopen(mf, "a");
+    if (!f) return;
+    fprintf(f, "%s\n", pkg);
+    fclose(f);
+}
+
 static int icon_path(const char *pkg, char *out, size_t n) {
     if (!pkg_ok(pkg)) return -1;
     snprintf(out, n, "%s/%s.png", P_ICONS, pkg);
     struct stat st;
     if (stat(out, &st) == 0 && st.st_size > 0) return 0;      // 已缓存
     mkdir(P_ICONS, 0755);
+    if (icon_missed(pkg)) return -1;
+
+    unzip_probe();
+    if (!g_unzip[0]) return -1;
+
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof tmp, "%s/.i.png", P_DATA);
     char cmd[1024];
+    // 1) 先按「ic_launcher 且体积最大」挑；2) 退而求其次取任意 mipmap png 里最大的
     snprintf(cmd, sizeof cmd,
         "apk=$(pm path %s 2>/dev/null | head -1 | sed 's/^package://'); "
         "[ -n \"$apk\" ] || exit 2; "
-        "e=$(unzip -l \"$apk\" 2>/dev/null | grep -oE 'res/[^ ]*(ic_launcher|icon)[^ ]*\\.png' "
-        "| awk '{print length, $0}' | sort -n | tail -1 | cut -d' ' -f2-); "
-        "[ -n \"$e\" ] || e=$(unzip -l \"$apk\" 2>/dev/null | grep -oE 'res/mipmap[^ ]*\\.png' | tail -1); "
+        "L=$(%s -l \"$apk\" 2>/dev/null); "
+        "[ -n \"$L\" ] || exit 4; "
+        "e=$(printf '%%s\\n' \"$L\" | awk 'NF>=4 && $4 ~ /^res\\/.*\\.png$/ && $4 ~ /ic_launcher|icon/ "
+        "{print $1\" \"$4}' | sort -n | tail -1 | cut -d' ' -f2-); "
+        "[ -n \"$e\" ] || e=$(printf '%%s\\n' \"$L\" | awk 'NF>=4 && $4 ~ /^res\\/mipmap.*\\.png$/ "
+        "{print $1\" \"$4}' | sort -n | tail -1 | cut -d' ' -f2-); "
         "[ -n \"$e\" ] || exit 3; "
-        "unzip -p \"$apk\" \"$e\" > %s 2>/dev/null", pkg, tmp);
+        "%s -p \"$apk\" \"$e\" > %s 2>/dev/null",
+        pkg, g_unzip, g_unzip, tmp);
+
     int rc = system(cmd);
-    if (rc != 0) return -1;
-    if (stat(tmp, &st) != 0 || st.st_size < 64) { unlink(tmp); return -1; }
+    if (rc != 0) {
+        logv("icon: %s 抠取失败 (rc=%d, 工具=%s)", pkg, rc, g_unzip);
+        icon_mark_miss(pkg);
+        return -1;
+    }
+    if (stat(tmp, &st) != 0 || st.st_size < 64) {
+        unlink(tmp);
+        icon_mark_miss(pkg);
+        return -1;
+    }
     rename(tmp, out);
     return 0;
 }
@@ -1749,8 +1850,24 @@ static void apply_profile(const char *name) {
         if (!g_game_extras) g_game_extras = 1;    // 借用同一套还原逻辑
     }
     if (!strcmp(name, "game")) {
-        hmbird_apply_game();
-        apply_game_extras();
+        /* 实测教训：v1.2.7 的「抬地板 + 双大核各钉一颗 + Job 压 uclamp」跑下来
+         * 比官方调度更差——频率更高、帧更不稳、温度功耗都涨。原因是官方 hmbird
+         * 本来就是按帧预算自己算频率，我们再叠一层地板和绑核只会让它和我们对打。
+         * 所以默认交还给官方，我们的干预改成 opt-in。
+         *
+         *   official   —— 什么都不写（默认，等同于装了个空模块）
+         *   light      —— 只对齐 frame_per_sec，不碰频率/线程
+         *   aggressive —— 旧行为：地板 + bg cpuset + hmbird 系数 + 线程归位
+         */
+        if (!strcmp(C.game_mode, "aggressive")) {
+            hmbird_apply_game();
+            apply_game_extras();
+        } else {
+            // 从 aggressive 切回官方时，要把之前写进去的地板/系数全部撤销
+            hmbird_restore();
+            restore_game_extras();
+            if (!strcmp(C.game_mode, "light")) hmbird_apply_frame_only();
+        }
     } else {
         hmbird_restore();
         restore_game_extras();
@@ -1910,6 +2027,7 @@ static void cmd_status(char *out, size_t n) {
     APP("cfg_launch_boost=%d\n", C.launch_boost);
     APP("cfg_log_level=%d\n", C.log_level);
     APP("cfg_charge_ctrl=%d\n", C.charge_ctrl);
+    APP("cfg_game_mode=%s\n", C.game_mode);
     APP("chg_last_pct=%d\n", g_chg_last_pct);
     APP("chg_suspend=%d\n", g_chg_suspended);
     APP("chg_gear=%d\n", g_chg_gear);
@@ -2796,7 +2914,7 @@ static int run_daemon(void) {
 
         charge_tick();
 
-        if (!strcmp(cur, "game") && C.thread_opt) {
+        if (!strcmp(cur, "game") && C.thread_opt && !strcmp(C.game_mode, "aggressive")) {
             long pid = find_game_pid(last_fg);
             if (pid > 0) apply_threads(pid, last_fg);
         }

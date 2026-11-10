@@ -10,7 +10,7 @@
 - ROOT：KernelSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.2.7 · versionCode 10009 · C 静态守护进程（193 KB，零依赖）
+> v1.2.8 · versionCode 10010 · C 静态守护进程（193 KB，零依赖）
 
 ![首页](shots/1home-light.png)
 
@@ -51,14 +51,27 @@ v1.2 是单个静态 arm64 二进制（`bin/feather`）：1 Hz 轮询、热路�
 
 ### 游戏（game）
 
-| 手段 | 说明 |
+**默认 `game_mode=official`：什么都不做。** 这是实测结论，不是偷懒：
+
+| | 官方调度 | 模块激进档 |
+|---|---:|---:|
+| perf 簇 CPU0-5 | 1231 MHz | 1716 MHz（+39.5%） |
+| prime 簇 CPU6-7 | 1017 MHz 恒定 | 768 MHz（−10%） |
+| FPS p1 | 161.0 | 135.8（−15.6%） |
+| JANK/100s | 0.67 | 5.78（8.7×） |
+| CPU 温度 | 52.8℃ | 59.9℃ |
+
+官方自己就把 UnityMain 钉在 CPU6-7、把 prime 保底在 1017 MHz；我们既拆了它的绑核、又降了它的
+prime，同时把不干活的 perf 簇抬了 39.5%——所以越调越差。三档在「场景 → 游戏档策略」里切：
+
+| 模式 | 行为 |
 |---|---|
-| 频率上限 | **不压**，把控制权还给 hmbird |
-| 频率地板 | 只抬 `scaling_min_freq`（约 1.55 GHz），掐掉 384/537 MHz 深谷 |
-| 帧预算 | `frame_per_sec` 跟随面板刷新率（默认 120 → 165 面板实际 6.06ms） |
-| 线程归位 | 见下方规则表，串行链两段分核 |
-| 前台识别 | 焦点窗口 → activity → top-app cgroup 三级降级，排除输入法；新进程命中游戏名单立刻重算 |
-| 后台隔离 | background cgroup 收窄、uclamp 压低 |
+| `official`（默认） | 频率 / 绑核 / hmbird 参数全部不写 |
+| `light` | 只对齐 `frame_per_sec` 与面板刷新率 |
+| `aggressive` | 抬地板 + 线程绑核 + Job 压 uclamp（仅 A/B 用） |
+
+前台识别仍然全程生效（焦点窗口 → activity → top-app cgroup 三级降级，排除输入法），
+只是不再影响游戏档的频率与绑核。
 
 **为什么绑核要绕路**：`hmbird_II.c` 的 `hmbird_task_change_cpumask()` 在 ops 启用期间会把任务掩码
 扩到 `task_cpu_possible_mask`，多核 `taskset` 基本无效；只有「单核掩码」会被尊重。所以规则的降级顺序是
@@ -164,7 +177,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.2.7.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.2.8.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -234,7 +247,7 @@ aarch64-linux-gnu-gcc -Os -s -static -Wno-format-truncation -Wno-unused-result \
   -o module/bin/feather src/feather.c
 
 # 端到端测试：假 /sys /proc /cgroup 树 + 真实 arm64 二进制（binfmt/qemu-user）
-FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 51 项
+FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 54 项
 
 # 打包
 python build.py
@@ -244,7 +257,7 @@ python build.py
 src/feather.c          单文件 C 守护进程（daemon + CLI + socket + HTTP + WebUI 托管）
 module/                Magisk/KSU/APatch 模块骨架（含 webroot/）
 module/bin/shell/      v1.0 的 shell 实现，仅作二进制跑不起来时的兜底
-tests/                 51 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
+tests/                 54 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
 docs/DESIGN.md         设计取舍、源码分析、每一轮实测复盘
 ```
 

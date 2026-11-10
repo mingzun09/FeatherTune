@@ -147,6 +147,27 @@
       <p class="hint">强度只作用于日常/省电/熄屏，游戏场景不受影响。</p>
     </div>
 
+    <div class="section-title">游戏档策略</div>
+    <div class="group card">
+      <div class="row" style="padding:14px 16px 6px">
+        <div class="row-main">
+          <span class="row-title">交给系统（官方调法）</span>
+          <span class="row-sub">不写频率、不绑核、不动 hmbird 参数</span>
+        </div>
+      </div>
+      <div class="segwrap" style="padding:0 16px 14px">
+        <div class="seg" id="gameModeSeg">
+          <button data-gm="official" class="on">官方</button>
+          <button data-gm="light">轻量</button>
+          <button data-gm="aggressive">激进</button>
+        </div>
+      </div>
+      <p class="hint" style="padding:0 16px 14px;margin:0">
+        实测：激进模式（抬地板 + 单核绑核）比官方调度差——perf 簇多给 39.5% 频率，
+        1% low 反而掉 15.6%，JANK 涨 8.7 倍，温度 +7℃。默认「官方」。
+      </p>
+    </div>
+
     <div class="section-title">场景频率上限</div>
     <div class="card table" id="sceneTable">
       <div class="tr th"><span>场景</span><span>性能簇</span><span>超大核</span></div>
@@ -263,7 +284,7 @@
 
     <div class="section-title">关于</div>
     <div class="card about">
-      <p><b>羽量调校 FeatherTune v1.2.7</b></p>
+      <p><b>羽量调校 FeatherTune v1.2.8</b></p>
       <p class="hint">面向 OnePlus 15 / SM8850 的场景化功耗调校。C 守护进程常驻（1Hz，零 fork），日常按负载收紧频率上限并压制厂商 boost；游戏场景与 Oplus 风驰协同，接管线程归位与调速器系数。</p>
       <p class="hint">兼容 Android 15–17 · KernelSU / Magisk / APatch · 元模块环境<br>WebUI 双通道：内核接口 / <code>http://127.0.0.1:7891/</code></p>
     </div>
