@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# late_start service: 启动 C 守护进程
+# late_start service: 启动 C 守护进程（单实例 + 看护）
 MODID=feather_tune
 DATA=/data/adb/feather
 BIN=/data/adb/modules/$MODID/bin
@@ -12,13 +12,24 @@ while [ $i -lt 30 ]; do
   i=$((i + 1))
 done
 
-# 兜底：老版本残留的 shell 守护进程先清掉
-if [ -f "$DATA/featherd-daemon.pid" ] && [ ! -x "$BIN/feather" ]; then
-  : # 交给 shell 版自己判断
-fi
+mkdir -p "$DATA" 2>/dev/null
 
 if [ -x "$BIN/feather" ]; then
-  "$BIN/feather" start
+  # 看护也只允许一份：用 mkdir 的原子性当锁（toybox 不一定有 flock）
+  LOCKDIR="$DATA/.sup.lock"
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    exit 0
+  fi
+  echo $$ > "$DATA/supervisor.pid"
+
+  (
+    while true; do
+      "$BIN/feather" run >/dev/null 2>&1
+      echo "[$(date '+%m-%d %H:%M:%S')] supervisor: 守护进程退出，2s 后重启" >> "$DATA/feather.log"
+      sleep 2
+    done
+    rmdir "$LOCKDIR" 2>/dev/null
+  ) >/dev/null 2>&1 </dev/null &
   exit 0
 fi
 

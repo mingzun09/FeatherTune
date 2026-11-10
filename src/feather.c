@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/prctl.h>
+#include <sys/file.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,8 +43,8 @@
 #define PATH_MAX 4096
 #endif
 
-#define APP_VER   "v1.2.8"
-#define APP_VC    10010
+#define APP_VER   "v1.2.9"
+#define APP_VC    10011
 #define MAX_FREQ  64
 #define MAX_POL   4
 #define MAX_RULES 64
@@ -664,6 +665,7 @@ typedef struct {
 
 static chg_node_t g_chg_cur;        // 恒流/输入电流上限
 static chg_node_t g_chg_suspend;    // 暂停充电开关
+static chg_node_t g_chg_cd;         // oplus_chg 的 cool_down 等级（0=不限，越大越限）
 static int  g_chg_ready;            // 节点已探测
 static int  g_chg_active;           // 当前正被我们接管
 static int  g_chg_suspended;
@@ -714,9 +716,17 @@ static void charge_init(void) {
     // 暂停开关不是必须的：没有就只靠电流兜底（设成最小值而不是 0）
     chg_pick(&g_chg_suspend, CHG_SUSPEND_CANDS,
              sizeof CHG_SUSPEND_CANDS / sizeof CHG_SUSPEND_CANDS[0]);
+    // ColorOS 上标准电流节点常常整个不存在（真机实测：constant_charge_current* 全没有），
+    // 厂商真正的入口是 oplus_chg 的 cool_down 等级。这里只探测+显示，写不写由后续实测决定。
+    chg_pick(&g_chg_cd, (const char *[]){
+        "/class/oplus_chg/battery/cool_down",
+        "/class/oplus_chg/battery/normal_cool_down",
+    }, 2);
     g_chg_orig_cur = strtol(g_chg_cur.orig, NULL, 10);
-    logv("charge: 电流节点 %s (%s) 暂停节点 %s",
-         g_chg_cur.path, g_chg_cur.orig, g_chg_suspend.valid ? g_chg_suspend.path : "无");
+    logv("charge: 电流节点 %s (%s) 暂停节点 %s cool_down %s",
+         g_chg_cur.valid ? g_chg_cur.path : "无", g_chg_cur.orig,
+         g_chg_suspend.valid ? g_chg_suspend.path : "无",
+         g_chg_cd.valid ? g_chg_cd.path : "无");
 }
 
 /* 温度阶梯（相对温度墙）：
@@ -855,6 +865,25 @@ static void charge_restore(void) {
 }
 
 // ------------------------------------------------------------------ hmbird --
+// 判断 pid 是否真的活着：僵尸（Z）虽然 kill(pid,0) 成功，但其实已经死了
+static int pid_alive(long pid) {
+    if (pid <= 0) return 0;
+    char path[64], buf[256];
+    snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return kill((pid_t)pid, 0) == 0 ? 1 : 0;
+    int alive = 0;
+    if (fgets(buf, sizeof buf, f)) {
+        char *rp = strrchr(buf, ')');        // comm 里可能有空格，用最后一个 ')' 定位
+        if (rp && rp[1] == ' ') {
+            char st = rp[2];
+            alive = (st != 'Z' && st != 'X');
+        }
+    }
+    fclose(f);
+    return alive;
+}
+
 static int g_hb_present, g_hb_tuned;
 
 static void hmbird_detect(void) {
@@ -1996,7 +2025,7 @@ static void cmd_status(char *out, size_t n) {
 
     int alive = 0;
     long pid = rdnum(P_PID);
-    if (pid > 0 && kill((pid_t)pid, 0) == 0) alive = 1;
+    if (pid_alive(pid)) alive = 1;
     APP("runner=%s\n", alive ? "running" : "stopped");
     APP("pid=%ld\n", pid > 0 ? pid : 0);
 
@@ -2032,6 +2061,11 @@ static void cmd_status(char *out, size_t n) {
     APP("chg_suspend=%d\n", g_chg_suspended);
     APP("chg_gear=%d\n", g_chg_gear);
     APP("chg_node=%s\n", g_chg_cur.valid ? g_chg_cur.path : "-");
+    {
+        char cdv[32] = "-";
+        if (g_chg_cd.valid) rdline(g_chg_cd.path, cdv, sizeof cdv);
+        APP("chg_cool_down=%s\n", cdv);
+    }
     APP("games=%d\n", g_ngames);
     APP("version=%s\n", APP_VER);
 #undef APP
@@ -2149,7 +2183,7 @@ static void cmd_doctor(char *out, size_t n) {
         APP("frame_per_sec_now=%s\n", rdline(pp, v, sizeof v) == 0 ? v : "n/a");
     }
     long pid = rdnum(P_PID);
-    APP("daemon pid=%ld alive=%d\n", pid > 0 ? pid : 0, pid > 0 && kill((pid_t)pid, 0) == 0);
+    APP("daemon pid=%ld alive=%d\n", pid > 0 ? pid : 0, pid_alive(pid));
 #undef APP
 }
 
@@ -2417,6 +2451,11 @@ static void run_cmd(const char *line, char *out, size_t n) {
                 "/class/oplus_chg/battery/chg_current_max",
                 "/class/oplus_chg/battery/fastchg_current_max",
                 "/class/oplus_chg/battery/input_suspend",
+                "/class/oplus_chg/battery/cool_down",
+                "/class/oplus_chg/battery/normal_cool_down",
+                "/class/oplus_chg/battery/batt_limit",
+                "/class/oplus_chg/battery/mmi_charging_enable",
+                "/class/power_supply/battery/voltage_max",
             };
             for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
                 char p2[PATH_MAX], v2[64];
@@ -2775,8 +2814,25 @@ static void on_sig(int s) { (void)s; g_stop = 1; }
 static long now_s(void) { return (long)time(NULL); }
 
 static int run_daemon(void) {
+        // 单实例：多份守护进程会互相抢 socket/state，表现就是“有时连得上有时连不上”
+        {
+            char lockp[PATH_MAX];
+            snprintf(lockp, sizeof lockp, "%s/.daemon.lock", P_DATA);
+            mkdir(P_DATA, 0755);
+            int lfd = open(lockp, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+            if (lfd >= 0) {
+                if (flock(lfd, LOCK_EX | LOCK_NB) != 0) {
+                    fprintf(stderr, "featherd-daemon: already running, exit\n");
+                    return 0;
+                }
+                // 锁 fd 故意不关闭：进程活着锁才在
+            }
+        }
     mkdir(P_DATA, 0755);
     log_rotate();
+    // 关键：WebUI 的 fetch 超时 / curl 提前退出都会让我们写一个已关闭的 socket，
+    // 默认动作是 SIGPIPE 直接杀进程（真机上就是这个把 daemon 打成了僵尸）。
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, on_sig);
     signal(SIGINT, on_sig);
     signal(SIGHUP, on_sig);
@@ -2957,7 +3013,7 @@ static int sock_client(const char *cmd, char *out, size_t n) {
 
 static int cli_daemonize(void) {
     long pid = rdnum(P_PID);
-    if (pid > 0 && kill((pid_t)pid, 0) == 0) {
+    if (pid_alive(pid)) {
         printf("already running (%ld)\n", pid);
         return 0;
     }
@@ -2990,7 +3046,7 @@ static int cli_main(int argc, char **argv, char *outbuf, size_t outsz) {
     if (!strcmp(c, "stop")) {
         long pid = rdnum(P_PID);
         if (pid > 0) kill((pid_t)pid, SIGTERM);
-        for (int i = 0; i < 20 && pid > 0 && kill((pid_t)pid, 0) == 0; i++) usleep(100 * 1000);
+        for (int i = 0; i < 20 && pid_alive(pid); i++) usleep(100 * 1000);
         if (pid > 0) kill((pid_t)pid, SIGKILL);
         unlink(P_PID);
         detect_topology(); capture_syscaps(); hmbird_detect(); restore_all();

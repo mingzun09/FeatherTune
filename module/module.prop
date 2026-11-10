@@ -1,6 +1,6 @@
 id=feather_tune
 name=羽量调校 · FeatherTune
-version=v1.2.8
-versionCode=10010
+version=v1.2.9
+versionCode=10011
 author=FeatherTune
 description=一加15 / SM8850 场景化功耗与调度调校。v1.2.1 修掉三个让游戏档从未生效的 bug（前台包名只读到第一个 pid、找到游戏主进程失败、基线被自己的限频污染），并按王者荣耀实测重排线程落核、游戏档抬高频率地板、帧率窗口对齐面板刷新率。C 守护进程常驻（静态 arm64，1Hz 零 fork），WebUI 走内核接口或本机 127.0.0.1:7891 双通道。支持 KernelSU / Magisk / APatch 与元模块。
