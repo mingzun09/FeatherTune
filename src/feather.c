@@ -41,8 +41,8 @@
 #define PATH_MAX 4096
 #endif
 
-#define APP_VER   "v1.2.3"
-#define APP_VC    10005
+#define APP_VER   "v1.2.4"
+#define APP_VC    10006
 #define MAX_FREQ  64
 #define MAX_POL   4
 #define MAX_RULES 64
@@ -824,17 +824,52 @@ static int is_system_pkg(const char *pkg) {
     return 0;
 }
 
-/* 前台包名
- * 真机 top-app 里通常同时有 systemui / 输入法 / 前台 App 的多个 pid，
- * 所以不能“第一个像包名的就返回”——要按 1) 游戏名单 2) 非系统包 3) 兜底 挑。
- * 结果写进 g_fg_source 方便 doctor 排查（1=top-app 2=dumpsys 0=失败）。 */
+/* ------------------------------------------------------------------ 前台判定 --
+ * 真机的 top-app cgroup 里同时有 systemui / 输入法 / 前台 App，只按 cgroup 猜
+ * 会把输入法当"前台应用"（实测 com.sohu.inputmethod.sogouoem 就顶上来过）。
+ * 现在按可靠性排序：
+ *   1) 焦点窗口 dumpsys window mCurrentFocus   —— 唯一正确的"用户正在看的 App"
+ *   2) dumpsys activity 的 topResumedActivity  —— 没有窗口时（全屏/悬浮）
+ *   3) top-app cgroup 扫描（排除输入法/系统包） —— 最便宜的兜底
+ * 触发时机：top-app pid 集合变化、出现新进程且是游戏、缓存超过 10s、屏幕亮起。
+ * 平时直接吃缓存，dumpsys 不会每秒都跑。
+ */
+static int is_game(const char *pkg);
+
 static char g_fg_cands[16][128];
 static int  g_fg_ncand;
-static int  g_fg_source;
+static int  g_fg_source;          // 1=焦点窗口 2=activity 3=cgroup 0=失败
+static char g_fg_cache[256];      // 上次成功结果
+static long g_fg_ts;              // 上次重算时间
+static unsigned g_topapp_sig;     // top-app pid 集合的指纹
+static long g_max_pid;            // 见过的最大的 /proc pid
+static char g_ime_pkg[128];       // 默认输入法包名（真机实测会顶到 top-app）
 
-static int collect_topapp(char *out, size_t n) {
+static int is_ime_pkg(const char *pkg) {
+    if (g_ime_pkg[0] && !strcmp(pkg, g_ime_pkg)) return 1;
+    if (strstr(pkg, "inputmethod") || strstr(pkg, ".ime") || strstr(pkg, "sogou")) return 1;
+    return 0;
+}
+
+static void load_ime(void) {
+    if (g_ime_pkg[0]) return;
+    FILE *pp = popen("settings get secure default_input_method 2>/dev/null", "r");
+    if (!pp) return;
+    char line[256] = "";
+    if (fgets(line, sizeof line, pp)) {
+        char *slash = strchr(line, '/');
+        if (slash) *slash = 0;
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (strchr(line, '.')) snprintf(g_ime_pkg, sizeof g_ime_pkg, "%s", line);
+    }
+    pclose(pp);
+}
+
+static int collect_topapp(unsigned *sig) {
     static const char *paths[] = { "/top-app/cgroup.procs", "/top-app/tasks" };
     g_fg_ncand = 0;
+    *sig = 0;
     for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
         char p[PATH_MAX], buf[4096];
         snprintf(p, sizeof p, "%s%s", P_CGRP, paths[i]);
@@ -843,6 +878,7 @@ static int collect_topapp(char *out, size_t n) {
         for (char *t = strtok_r(buf, "\n", &save); t && g_fg_ncand < 16; t = strtok_r(NULL, "\n", &save)) {
             long pid = strtol(t, NULL, 10);
             if (pid <= 0) continue;
+            *sig = *sig * 31u + (unsigned)pid;
             char cf[PATH_MAX], cl[256];
             snprintf(cf, sizeof cf, "%s/%ld/cmdline", P_PROC, pid);
             if (rdline(cf, cl, sizeof cl) != 0 || !cl[0]) continue;
@@ -855,49 +891,136 @@ static int collect_topapp(char *out, size_t n) {
         }
         if (g_fg_ncand) break;
     }
-    if (!g_fg_ncand) return -1;
+    return g_fg_ncand ? 0 : -1;
+}
 
-    // 1) 命中游戏名单的优先（这也是我们最关心的判定）
+static int fg_from_cgroup(char *out, size_t n) {
+    unsigned sig;
+    if (collect_topapp(&sig) != 0) return -1;
     for (int k = 0; k < g_fg_ncand; k++)
         if (is_game(g_fg_cands[k])) { snprintf(out, n, "%s", g_fg_cands[k]); return 0; }
-    // 2) 跳过系统包
     for (int k = 0; k < g_fg_ncand; k++)
-        if (!is_system_pkg(g_fg_cands[k])) { snprintf(out, n, "%s", g_fg_cands[k]); return 0; }
-    // 3) 兜底
-    snprintf(out, n, "%s", g_fg_cands[0]);
+        if (!is_system_pkg(g_fg_cands[k]) && !is_ime_pkg(g_fg_cands[k])) {
+            snprintf(out, n, "%s", g_fg_cands[k]);
+            return 0;
+        }
+    return -1;
+}
+
+// 从一行 dumpsys 里抠出包名：... u0 com.pkg/.Act ...
+static int pkg_from_line(const char *line, char *out, size_t n) {
+    const char *u = strstr(line, "u0 ");
+    const char *tok = u ? u + 3 : line;
+    // 跳过 Window{ / ActivityRecord{ 之类的前缀
+    while (*tok && !isalnum((unsigned char)*tok)) tok++;
+    char tmp[256];
+    size_t i = 0;
+    for (; tok[i] && i < sizeof tmp - 1; i++) {
+        if (tok[i] == ' ' || tok[i] == '\t' || tok[i] == '}' || tok[i] == '\r' || tok[i] == '\n') break;
+        tmp[i] = tok[i];
+    }
+    tmp[i] = 0;
+    char *slash = strchr(tmp, '/');
+    if (slash) *slash = 0;
+    if (!strchr(tmp, '.')) return -1;
+    if (!strncmp(tmp, "Window", 6) || !strncmp(tmp, "ActivityRecord", 14)) return -1;
+    snprintf(out, n, "%s", tmp);
     return 0;
 }
 
-// 兜底：dumpsys（重，只在廉价路径全失败时用，且 6 秒内不重复）
-static int fg_from_dumpsys(char *out, size_t n) {
-    static long last_try;
-    long now = (long)time(NULL);
-    if (now - last_try < 6) return -1;
-    last_try = now;
-    FILE *pp = popen("dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity|mResumedActivity'", "r");
+static int fg_from_cmd(char *out, size_t n, const char *cmd) {
+    FILE *pp = popen(cmd, "r");
     if (!pp) return -1;
     char line[512];
     int ok = -1;
     if (fgets(line, sizeof line, pp)) {
-        // ActivityRecord{... u0 com.xxx/.MainActivity t123}
-        char *u = strstr(line, "u0 ");
-        char *tok = u ? u + 3 : line;
-        char *sp = strpbrk(tok, " 	}\r\n");
-        char *slash = strchr(tok, '/');
-        if (slash && (!sp || slash < sp)) sp = slash;
-        if (sp && sp > tok) {
-            *sp = 0;
-            if (strchr(tok, '.')) { snprintf(out, n, "%s", tok); ok = 0; }
-        }
+        if (pkg_from_line(line, out, n) == 0) ok = 0;
     }
     pclose(pp);
     return ok;
 }
 
+static int fg_from_window(char *out, size_t n) {
+    return fg_from_cmd(out, n,
+        "dumpsys window 2>/dev/null | grep -m1 -E 'mCurrentFocus|mFocusedApp'");
+}
+
+static int fg_from_activity(char *out, size_t n) {
+    return fg_from_cmd(out, n,
+        "dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity|mResumedActivity'");
+}
+
+/* AsoulOpt 那套思路：盯 /proc 的新进程，发现新起来的进程命中了游戏名单就立刻重算，
+ * 不用等用户切窗口/等缓存过期。只做 readdir + 少量 cmdline 读，1Hz 下开销可忽略。 */
+static int new_game_process(void) {
+    DIR *d = opendir(P_PROC);
+    if (!d) return 0;
+    long mx = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        long v = strtol(de->d_name, NULL, 10);
+        if (v > mx) mx = v;
+    }
+    closedir(d);
+    if (mx <= 0) return 0;
+    if (g_max_pid <= 0) { g_max_pid = mx; return 0; }
+    if (mx <= g_max_pid) return 0;
+    long from = g_max_pid;
+    g_max_pid = mx;
+    if (mx - from > 256) return 1;      // pid 大跳变（重启/清理），直接重算一次
+    for (long pid = from + 1; pid <= mx; pid++) {
+        char cf[PATH_MAX], cl[256];
+        snprintf(cf, sizeof cf, "%s/%ld/cmdline", P_PROC, pid);
+        if (rdline(cf, cl, sizeof cl) != 0 || !cl[0]) continue;
+        if (!strchr(cl, '.')) continue;
+        if (is_game(cl)) return 1;
+    }
+    return 0;
+}
+
 static int foreground_pkg(char *out, size_t n) {
-    if (collect_topapp(out, n) == 0) { g_fg_source = 1; return 0; }
-    if (fg_from_dumpsys(out, n) == 0) { g_fg_source = 2; return 0; }
+    static int inited;
+    if (!inited) { inited = 1; load_ime(); }
+
+    unsigned sig = 0;
+    int sig_ok = (collect_topapp(&sig) == 0);
+    long now = (long)time(NULL);
+
+    int forced = 0;
+    if (new_game_process()) forced = 1;
+    if (sig_ok && g_topapp_sig && sig != g_topapp_sig) forced = 1;   // App 切换
+    if (sig_ok) g_topapp_sig = sig;
+    // 缓存里的那个包已经不在 top-app 了 → 说明它被切走了，必须重算
+    if (!forced && sig_ok && g_fg_cache[0]) {
+        int still = 0;
+        for (int k = 0; k < g_fg_ncand; k++)
+            if (!strcmp(g_fg_cands[k], g_fg_cache)) { still = 1; break; }
+        if (!still) forced = 1;
+    }
+
+    if (!forced && g_fg_cache[0] && now - g_fg_ts < 10) {
+        snprintf(out, n, "%s", g_fg_cache);
+        return 0;
+    }
+
+    char res[256] = "";
     g_fg_source = 0;
+    if (fg_from_window(res, sizeof res) == 0)      g_fg_source = 1;
+    else if (fg_from_activity(res, sizeof res) == 0) g_fg_source = 2;
+    else if (fg_from_cgroup(res, sizeof res) == 0)   g_fg_source = 3;
+
+    if (g_fg_source && res[0]) {
+        snprintf(g_fg_cache, sizeof g_fg_cache, "%s", res);
+        g_fg_ts = now;
+        snprintf(out, n, "%s", res);
+        return 0;
+    }
+    // 全失败：保留上次结果，别让状态在空与有之间抖
+    if (g_fg_cache[0]) {
+        snprintf(out, n, "%s", g_fg_cache);
+        return 0;
+    }
+    out[0] = 0;
     return -1;
 }
 
@@ -1432,8 +1555,8 @@ static void cmd_doctor(char *out, size_t n) {
     {
         char fgp[256];
         int fr = foreground_pkg(fgp, sizeof fgp);
-        APP("fg=%s (source=%d 0=none 1=top-app 2=dumpsys) cands=%d\n",
-            fr == 0 ? fgp : "-", g_fg_source, g_fg_ncand);
+        APP("fg=%s (source=%d 1=window 2=activity 3=cgroup 0=none) cands=%d ime=%s\n",
+            fr == 0 ? fgp : "-", g_fg_source, g_fg_ncand, g_ime_pkg[0] ? g_ime_pkg : "-");
         for (int k = 0; k < g_fg_ncand; k++)
             APP("  cand%d=%s%s\n", k, g_fg_cands[k], is_game(g_fg_cands[k]) ? " [game]" : "");
     }
@@ -1954,8 +2077,10 @@ static int run_daemon(void) {
         if (!strcmp(want, cand)) cand_n++;
         else { snprintf(cand, sizeof cand, "%s", want); cand_n = 1; }
 
+        // 进游戏要快（用户已经在打了），出游戏要稳（避免一次探测抖动就把地板撤掉）
         int need = 2;
-        if (!strcmp(cur, "game")) need = 4;
+        if (!strcmp(cand, "game")) need = 1;
+        else if (!strcmp(cur, "game")) need = 3;
         if (!cur[0]) need = 1;
         // 手动指定模式时不做防抖：WebUI 点一下要立刻生效，防抖只服务于 auto 识别
         if (strcmp(C.mode, "auto")) need = 1;

@@ -1,0 +1,6 @@
+#!/bin/sh
+case "$*" in
+  *window*)   [ -s "$FAKE_WIN_FG" ] && echo "  mCurrentFocus=Window{1a2b3c u0 $(cat "$FAKE_WIN_FG")/com.x.MainActivity}" ;;
+  *activity*) [ -s "$FAKE_WIN_FG" ] && echo "    topResumedActivity=ActivityRecord{9f8e u0 $(cat "$FAKE_WIN_FG")/.MainActivity t42}" ;;
+esac
+exit 0

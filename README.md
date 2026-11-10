@@ -10,7 +10,7 @@
 - ROOT：KernelSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.2.3 · versionCode 10005 · C 静态守护进程（193 KB，零依赖）
+> v1.2.4 · versionCode 10006 · C 静态守护进程（193 KB，零依赖）
 
 ![首页](shots/1home-light.png)
 
@@ -57,6 +57,7 @@ v1.2 是单个静态 arm64 二进制（`bin/feather`）：1 Hz 轮询、热路�
 | 频率地板 | 只抬 `scaling_min_freq`（约 1.55 GHz），掐掉 384/537 MHz 深谷 |
 | 帧预算 | `frame_per_sec` 跟随面板刷新率（默认 120 → 165 面板实际 6.06ms） |
 | 线程归位 | 见下方规则表，串行链两段分核 |
+| 前台识别 | 焦点窗口 → activity → top-app cgroup 三级降级，排除输入法；新进程命中游戏名单立刻重算 |
 | 后台隔离 | background cgroup 收窄、uclamp 压低 |
 
 **为什么绑核要绕路**：`hmbird_II.c` 的 `hmbird_task_change_cpumask()` 在 ops 启用期间会把任务掩码
@@ -113,7 +114,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.2.3.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.2.4.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -156,6 +157,19 @@ v1.2.3 全部改掉并用只读 `probe` 验证：
 第四条是重点：v1.2.2 报 `selftest prefer_cpu=FAIL` 是**假阴性**——真机上 `cat /proc/sys/hmbird_II/prefer_cluster`
 能看到 `feather::feather::2`，说明写入一直是成功的。
 
+### 前台应用是怎么认的（v1.2.4）
+
+真机 top-app cgroup 里同时躺着系统 UI、输入法和前台 App，只按 cgroup 猜会把**输入法当天**
+（实测 `com.sohu.inputmethod.sogouoem` 就这么顶上来过一次）。现在是三级降级：
+
+1. `dumpsys window` 的 `mCurrentFocus` —— 用户真正在看的窗口，唯一准确的来源
+2. `dumpsys activity activities` 的 `topResumedActivity` —— 没有焦点窗口时（全屏/悬浮窗）
+3. top-app cgroup 扫描 —— 最便宜的兜底，排除输入法与系统包
+
+重算时机：top-app pid 集合变化、缓存里的包已经不在 top-app、`/proc` 出现新进程且命中游戏名单
+（AsoulOpt 那套思路）、屏幕亮起。其余时间吃缓存，dumpsys 不会每秒都跑。
+读不到时**保留上次结果**，不让状态在"空/有"之间抖。
+
 ### 仍待观察
 
 - `background/cpus` 游戏档收窄到 `0-3`（厂商默认 `0-5`）：需要实测确认不会把后台的音频/网络挤爆
@@ -170,7 +184,7 @@ aarch64-linux-gnu-gcc -Os -s -static -Wno-format-truncation -Wno-unused-result \
   -o module/bin/feather src/feather.c
 
 # 端到端测试：假 /sys /proc /cgroup 树 + 真实 arm64 二进制（binfmt/qemu-user）
-FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 37 项
+FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 40 项
 
 # 打包
 python build.py
@@ -180,7 +194,7 @@ python build.py
 src/feather.c          单文件 C 守护进程（daemon + CLI + socket + HTTP + WebUI 托管）
 module/                Magisk/KSU/APatch 模块骨架（含 webroot/）
 module/bin/shell/      v1.0 的 shell 实现，仅作二进制跑不起来时的兜底
-tests/                 37 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
+tests/                 40 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
 docs/DESIGN.md         设计取舍、源码分析、每一轮实测复盘
 ```
 

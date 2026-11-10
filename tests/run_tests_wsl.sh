@@ -38,6 +38,20 @@ export FEATHER_SYS_ROOT="$FAKE/sys"
 export FEATHER_PROC_ROOT="$FAKE/proc"
 export FEATHER_HMBIRD_SYS="$FAKE/proc/sys/hmbird_II"
 export FEATHER_WR_TRACE="$DATA/wr.trace"
+
+# 假 dumpsys：验证“焦点窗口优先”这条路径（真机上 dumpsys 是唯一准确的来源）
+FAKEBIN="$HERE/fakebin"; rm -rf "$FAKEBIN"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/dumpsys" <<'EOS'
+#!/bin/sh
+case "$*" in
+  *window*)   [ -s "$FAKE_WIN_FG" ] && echo "  mCurrentFocus=Window{1a2b3c u0 $(cat "$FAKE_WIN_FG")/com.x.MainActivity}" ;;
+  *activity*) [ -s "$FAKE_WIN_FG" ] && echo "    topResumedActivity=ActivityRecord{9f8e u0 $(cat "$FAKE_WIN_FG")/.MainActivity t42}" ;;
+esac
+exit 0
+EOS
+chmod +x "$FAKEBIN/dumpsys"
+export FAKE_WIN_FG="$DATA/window_fg"
+export PATH="$FAKEBIN:$PATH"
 export FEATHER_HTTP_PORT=17891          # 与线上 7891 隔离，避免抢端口
 
 echo "== 1. 拓扑 / 限频纯函数 =="
@@ -65,6 +79,19 @@ echo "== 2.5 规则加载 =="
 out=$("$BIN" doctor 2>&1)
 check "规则条数 >= 9"              'echo "$out" | grep -qE "^rules=([9]|[1-9][0-9])"' "$(echo "$out" | grep '^rules=')"
 check "Job.worker 规则已加载"      'echo "$out" | grep -q "Job\\\\.worker"' "$(echo "$out" | grep -c 'rule')"
+
+echo "== 2.7 焦点窗口优先（top-app 里游戏与别的 App 并存，窗口是别的 App）=="
+printf '4242\n5555\n' > "$FAKE/sys/fs/cgroup/top-app/cgroup.procs"
+echo "com.test.app" > "$FAKE_WIN_FG"
+sleep 5
+out=$("$BIN" status 2>&1)
+check "窗口来源生效"  'echo "$out" | grep -q "^fg=com.test.app"' "$(echo "$out" | grep '^fg=')"
+check "因此不判为游戏" 'echo "$out" | grep -qx "profile=daily"'  "$(echo "$out" | grep '^profile=')"
+printf '4242\n' > "$FAKE/sys/fs/cgroup/top-app/cgroup.procs"
+echo "com.test.game" > "$FAKE_WIN_FG"
+sleep 4
+out=$("$BIN" status 2>&1)
+check "窗口切回游戏即恢复" 'echo "$out" | grep -qx "profile=game"' "$(echo "$out" | grep '^profile=')"
 
 echo "== 3. UNIX socket 命令 =="
 out=$("$BIN" status 2>&1)
@@ -103,6 +130,7 @@ check "tune=1 时写 cpus_reserved" 'grep -qx 192 "$FAKE/proc/sys/hmbird_II/cpus
 "$BIN" mode auto >/dev/null 2>&1
 
 echo "== 5. 切普通应用 -> 日常收紧 =="
+echo "com.test.app" > "$FAKE_WIN_FG"
 printf '5555\n' > "$FAKE/sys/fs/cgroup/top-app/cgroup.procs"
 sleep 6
 S=$(cat "$DATA/state" 2>/dev/null)
