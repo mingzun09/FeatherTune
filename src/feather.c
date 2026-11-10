@@ -41,8 +41,8 @@
 #define PATH_MAX 4096
 #endif
 
-#define APP_VER   "v1.2.2"
-#define APP_VC    10004
+#define APP_VER   "v1.2.3"
+#define APP_VC    10005
 #define MAX_FREQ  64
 #define MAX_POL   4
 #define MAX_RULES 64
@@ -50,16 +50,39 @@
 static int g_http_port = 7891;   // 可由 FEATHER_HTTP_PORT 覆盖（测试隔离端口）
 
 // ------------------------------------------------------------------ paths --
-static char P_DATA[PATH_MAX], P_CPU[PATH_MAX], P_CGRP[PATH_MAX], P_SYS[PATH_MAX],
+static char P_DATA[PATH_MAX], P_CPU[PATH_MAX], P_CGRP[PATH_MAX], P_CPUCTL[PATH_MAX],
+            P_SYS[PATH_MAX],
             P_PROC[PATH_MAX], P_HM[PATH_MAX], P_CONF[PATH_MAX], P_GAMES[PATH_MAX],
             P_RULES[PATH_MAX], P_STATE[PATH_MAX], P_LOG[PATH_MAX], P_PID[PATH_MAX],
             P_SOCK[PATH_MAX];
+static char g_cset_node[16] = "cpuset.cpus";   // cpuset v1 用 cpus，v2 用 cpuset.cpus
 
 static void path_init(void) {
     const char *e;
     snprintf(P_DATA, sizeof P_DATA, "%s", (e = getenv("FEATHER_DATA")) ? e : "/data/adb/feather");
     snprintf(P_CPU, sizeof P_CPU, "%s", (e = getenv("FEATHER_CPU_ROOT")) ? e : "/sys/devices/system/cpu");
-    snprintf(P_CGRP, sizeof P_CGRP, "%s", (e = getenv("FEATHER_CGROUP_ROOT")) ? e : "/sys/fs/cgroup");
+    // cpuset 根：Android 13+ 多数机型在 /dev/cpuset（cgroup v1 语义，节点名 cpus），
+    // 少数在 /sys/fs/cgroup。uclamp 则在 /dev/cpuctl（cpu 控制器）。三者不能混用。
+    if ((e = getenv("FEATHER_CGROUP_ROOT"))) {
+        snprintf(P_CGRP, sizeof P_CGRP, "%s", e);
+    } else if (access("/dev/cpuset/top-app", F_OK) == 0) {
+        snprintf(P_CGRP, sizeof P_CGRP, "%s", "/dev/cpuset");
+    } else {
+        snprintf(P_CGRP, sizeof P_CGRP, "%s", "/sys/fs/cgroup");
+    }
+    if ((e = getenv("FEATHER_CPUCTL_ROOT"))) {
+        snprintf(P_CPUCTL, sizeof P_CPUCTL, "%s", e);
+    } else if (access("/dev/cpuctl/top-app", F_OK) == 0) {
+        snprintf(P_CPUCTL, sizeof P_CPUCTL, "%s", "/dev/cpuctl");
+    } else {
+        snprintf(P_CPUCTL, sizeof P_CPUCTL, "%s", P_CGRP);
+    }
+    {
+        char probe[PATH_MAX];
+        snprintf(probe, sizeof probe, "%s/background/cpus", P_CGRP);
+        snprintf(g_cset_node, sizeof g_cset_node, "%s",
+                 access(probe, R_OK) == 0 ? "cpus" : "cpuset.cpus");
+    }
     snprintf(P_SYS, sizeof P_SYS, "%s", (e = getenv("FEATHER_SYS_ROOT")) ? e : "/sys");
     snprintf(P_PROC, sizeof P_PROC, "%s", (e = getenv("FEATHER_PROC_ROOT")) ? e : "/proc");
     snprintf(P_HM, sizeof P_HM, "%s", (e = getenv("FEATHER_HMBIRD_SYS")) ? e : "/proc/sys/hmbird_II");
@@ -71,6 +94,9 @@ static void path_init(void) {
     snprintf(P_PID, sizeof P_PID, "%s/featherd.pid", P_DATA);
     snprintf(P_SOCK, sizeof P_SOCK, "%s/control.sock", P_DATA);
 }
+
+static int  read_all(const char *path, char *buf, size_t n);
+static int  rdline(const char *path, char *buf, size_t n);
 
 // -------------------------------------------------------------------- log --
 static int g_log_level = 1;
@@ -275,7 +301,7 @@ static long freq_ge(policy_t *p, long target) {
 static int g_refresh;          // Hz，0=未知
 
 static void detect_refresh(void) {
-    char b[512];
+    char b[4096];
     static const char *cands[] = {"/class/graphics/fb0/modes", "/class/graphics/fb0/mode"};
     for (size_t i = 0; i < sizeof cands / sizeof cands[0] && !g_refresh; i++) {
         char path[PATH_MAX];
@@ -287,9 +313,44 @@ static void detect_refresh(void) {
         int v = atoi(dash + 1);
         if (v >= 30 && v <= 240) g_refresh = v;
     }
+    // Android 上 fb0/modes 多数不可读，真正可靠的是 DRM 的模式表：
+    //   1272x2772x165cmd   1272x2772x120cmd   1272x2772x60cmd
+    // 取其中最大的刷新率（游戏档要的是它能跑到多少）
+    if (!g_refresh) {
+        static const char *drm[] = {
+            "/class/drm/card0-DSI-1/modes", "/class/drm/card0-DSI-1/mode",
+            "/class/drm/card0/modes",
+        };
+        for (size_t i = 0; i < sizeof drm / sizeof drm[0] && !g_refresh; i++) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof path, "%s%s", P_SYS, drm[i]);
+            if (read_all(path, b, sizeof b) < 0) continue;
+            int best = 0;
+            char *line = b;
+            while (line && *line) {
+                char *nl = strchr(line, '\n');
+                if (nl) *nl = 0;
+                // 形如 1272x2772x165cmd：取第二个 'x' 之后的数字
+                char *x1 = strchr(line, 'x');
+                if (x1) {
+                    char *x2 = strchr(x1 + 1, 'x');
+                    if (x2) {
+                        int v = atoi(x2 + 1);
+                        if (v >= 30 && v <= 240 && v > best) best = v;
+                    }
+                }
+                line = nl ? nl + 1 : NULL;
+            }
+            if (best) g_refresh = best;
+        }
+    }
 }
 
 static char g_bg_cpus_orig[64];
+
+static void bg_cpus_path(char *p, size_t n) {
+    snprintf(p, n, "%s/background/%s", P_CGRP, g_cset_node);
+}
 static int g_game_extras;
 
 static void set_policy_min(int idx, long f) {
@@ -310,7 +371,7 @@ static void apply_game_extras(void) {
     // 2) 后台 cgroup 赶出超大核
     if (C.game_bg_cpus) {
         char p[PATH_MAX], cur[64];
-        snprintf(p, sizeof p, "%s/background/cpuset.cpus", P_CGRP);
+        bg_cpus_path(p, sizeof p);
         if (rdline(p, cur, sizeof cur) == 0) {
             if (!g_bg_cpus_orig[0]) snprintf(g_bg_cpus_orig, sizeof g_bg_cpus_orig, "%s", cur);
             if (strcmp(cur, "0-3")) wrp(p, "0-3");
@@ -327,7 +388,7 @@ static void restore_game_extras(void) {
                                  ? g_base_min[idx_perf] : pol[idx_perf].min);
     if (C.game_bg_cpus && g_bg_cpus_orig[0]) {
         char p[PATH_MAX];
-        snprintf(p, sizeof p, "%s/background/cpuset.cpus", P_CGRP);
+        bg_cpus_path(p, sizeof p);
         wrp(p, g_bg_cpus_orig);
     }
     g_game_extras = 0;
@@ -523,11 +584,44 @@ static void profile_uclamp(const char *name, int *bg, int *fg, int *top) {
     else                                { *bg = 30; *fg = 55; *top = 100; }
 }
 
+static int g_uclamp_ok = 1;      // 0=已确认不兼容/不可写，本次运行不再尝试
+static int g_uclamp_touched;
+
+// uclamp 在不同内核上有两种读法：整数 0-1024，或百分数字符串 "30.00"。
+// 这里写入后读回校验，对不上就整体停用并在日志/doctor 里说明，不去盲猜格式。
 static void set_uclamp(const char *group, int maxpct) {
-    char path[PATH_MAX], v[32];
-    snprintf(path, sizeof path, "%s/%s/cpu.uclamp.max", P_CGRP, group);
-    snprintf(v, sizeof v, "max %d%%", maxpct);
-    wrp(path, v);
+    if (!g_uclamp_ok) return;
+    char path[PATH_MAX], v[32], back[64];
+    snprintf(path, sizeof path, "%s/%s/cpu.uclamp.max", P_CPUCTL, group);
+    if (access(path, W_OK) != 0) {
+        g_uclamp_ok = 0;
+        logv("uclamp: %s 不可写，停用", path);
+        return;
+    }
+    long val = (long)maxpct * 1024 / 100;
+    snprintf(v, sizeof v, "%ld", val);
+    if (wrp(path, v) != 0) { g_uclamp_ok = 0; logv("uclamp: 写入失败，停用"); return; }
+    if (rdline(path, back, sizeof back) == 0 && back[0]) {
+        double r = atof(back);
+        if (r > 200.0) r = r / 1024.0 * 100.0;      // 读回 307 → 30%
+        if (maxpct >= 5 && r < 2.0) {
+            g_uclamp_ok = 0;
+            logv("uclamp: 读回 '%s' 与写入 %ld 不符，格式不兼容，停用", back, val);
+            return;
+        }
+    }
+    g_uclamp_touched = 1;
+}
+
+static void uclamp_restore(void) {
+    if (!g_uclamp_touched) return;
+    static const char *groups[] = {"top-app", "foreground", "background"};
+    for (size_t i = 0; i < sizeof groups / sizeof groups[0]; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof path, "%s/%s/cpu.uclamp.max", P_CPUCTL, groups[i]);
+        wrp(path, "max");
+    }
+    g_uclamp_touched = 0;
 }
 
 // ------------------------------------------------------------------ hmbird --
@@ -540,6 +634,23 @@ static void hmbird_detect(void) {
         const char *g = gov_of(idx_prime);
         if (strstr(g, "hmbird") || strstr(g, "scx")) g_hb_present = 1;
     }
+}
+
+// hmbird 的 show 回调把所有已设置的条目打成 "<leader>::<comm>::<hex>"，
+// 拿原文比对必然误报，只能按「值是否出现」判断，测完写 0 清掉自己的条目。
+static int hm_selftest(const char *node, const char *hexval, long me) {
+    char p[PATH_MAX], v[64], b[2048], want[32];
+    snprintf(p, sizeof p, "%s/%s", P_HM, node);
+    snprintf(v, sizeof v, "%ld %s", me, hexval);
+    if (wrp(p, v) != 0) return 0;
+    unsigned long hv = strtoul(hexval, NULL, 16);
+    const char *fmt = strcmp(node, "prefer_preempt") == 0 ? "::%lu" : "::%lx";
+    snprintf(want, sizeof want, fmt, strcmp(node, "prefer_preempt") == 0 ? hv : hv);
+    int ok = 0;
+    if (read_all(p, b, sizeof b) >= 0 && strstr(b, want)) ok = 1;
+    snprintf(v, sizeof v, "%ld 0", me);      // 清理自己写入的条目
+    wrp(p, v);
+    return ok;
 }
 
 static int hmbird_live(void) {
@@ -948,6 +1059,18 @@ static void rules_load(void) {
         char pkg[128];
         snprintf(pkg, sizeof pkg, "%.*s", (int)(sp2 - st), st);
         const char *mask = mask_of(tgt);
+        // 非核掩码目标：交给 hmbird 自己的调度属性（不进亲和性）
+        if (!mask && (!strcmp(tgt, "preempt") || !strcmp(tgt, "idle"))) {
+            rule_t *r0 = &g_rules[g_nrules];
+            memset(r0, 0, sizeof *r0);
+            snprintf(r0->pkg, sizeof r0->pkg, "%s", pkg);
+            snprintf(r0->pat, sizeof r0->pat, "%s", pat);
+            if (regcomp(&r0->re, pat, REG_EXTENDED | REG_NOSUB) != 0) continue;
+            r0->valid = 1;
+            r0->target = (tgt[0] == 'p') ? "preempt" : "idle";
+            g_nrules++;
+            continue;
+        }
         if (!mask) {
             logmsg("rules: 跳过未知目标 '%s' 的行", tgt);
             continue;
@@ -972,6 +1095,7 @@ static long g_seen[MAX_SEEN];
 static int g_nseen;
 static long g_seen_pid = -1;
 static int g_threads_pinned;
+static int g_schedprop_pinned;
 
 static int seen_has(long tid) {
     for (int i = 0; i < g_nseen; i++) if (g_seen[i] == tid) return 1;
@@ -1058,7 +1182,17 @@ static void apply_threads(long pid, const char *pkg) {
                 if (regexec(&g_rules[i].re, comm, 0, NULL, 0) == 0) target = g_rules[i].target;
             }
         }
-        if (target) { pin_tid(tid, target); added++; }
+        if (target) {
+            if (!strcmp(target, "preempt") || !strcmp(target, "idle")) {
+                char node[PATH_MAX], v[32];
+                snprintf(node, sizeof node, "%s/prefer_%s", P_HM, target);
+                snprintf(v, sizeof v, "%ld 1", tid);
+                if (wrp(node, v) == 0) { g_schedprop_pinned++; added++; }
+            } else {
+                pin_tid(tid, target);
+                added++;
+            }
+        }
     }
     closedir(d);
     if (added) {
@@ -1099,7 +1233,10 @@ static void apply_profile(const char *name) {
     logv("apply: %s perf=%d%%(%ld) prime=%d%%(%ld)", name, pp, g_cap_perf, pr, g_cap_prime);
 }
 
+static void uclamp_restore(void);
+
 static void restore_all(void) {
+    uclamp_restore();
     logv("restore_all: npol=%d extras=%d", npol, g_game_extras);
     for (int i = 0; i < npol; i++) {
         long v = (g_base_ok && g_base_max[i] > 0) ? g_base_max[i] : pol[i].max;
@@ -1305,11 +1442,19 @@ static void cmd_doctor(char *out, size_t n) {
             "/top-app/cgroup.procs", "/top-app/tasks",
             "/background/cpuset.cpus", "/cgroup.controllers",
         };
-        APP("cgroup_root=%s\n", P_CGRP);
+        APP("cgroup_root=%s (node=%s)\n", P_CGRP, g_cset_node);
+        APP("cpuctl_root=%s uclamp_ok=%d\n", P_CPUCTL, g_uclamp_ok);
         for (size_t i = 0; i < sizeof cg_probe / sizeof cg_probe[0]; i++) {
             char p[PATH_MAX];
             snprintf(p, sizeof p, "%s%s", P_CGRP, cg_probe[i]);
             APP("  probe %s = %s\n", cg_probe[i], access(p, R_OK) == 0 ? "readable" : "MISSING");
+        }
+        {
+            char p2[PATH_MAX];
+            bg_cpus_path(p2, sizeof p2);
+            APP("  bg_cpus %s = %s\n", p2, access(p2, W_OK) == 0 ? "writable" : "MISSING");
+            snprintf(p2, sizeof p2, "%s/foreground/cpu.uclamp.max", P_CPUCTL);
+            APP("  uclamp %s = %s\n", p2, access(p2, W_OK) == 0 ? "writable" : "MISSING");
         }
         FILE *pc = fopen("/proc/self/cgroup", "r");
         if (pc) {
@@ -1336,10 +1481,10 @@ static void cmd_doctor(char *out, size_t n) {
         int me = (int)getpid();
         snprintf(pp, sizeof pp, "%s/prefer_cluster", P_HM);
         snprintf(v, sizeof v, "%d 0x2", me);
-        APP("selftest prefer_cluster=%s\n", wrverify(pp, v) == 0 ? "ok" : "FAIL");
-        snprintf(pp, sizeof pp, "%s/prefer_cpu", P_HM);
-        snprintf(v, sizeof v, "%d 0x3", me);
-        APP("selftest prefer_cpu=%s\n", wrverify(pp, v) == 0 ? "ok" : "FAIL");
+        // 读回是 "<leader>::<comm>::<hex>" 列表，不是写进去的原文，所以按值比对
+        APP("selftest prefer_cluster=%s\n", hm_selftest("prefer_cluster", "0x2", me) ? "ok" : "FAIL");
+        APP("selftest prefer_cpu=%s\n", hm_selftest("prefer_cpu", "0x40", me) ? "ok" : "FAIL");
+        APP("selftest prefer_preempt=%s\n", hm_selftest("prefer_preempt", "1", me) ? "ok" : "FAIL");
         snprintf(pp, sizeof pp, "%s/frame_per_sec", P_HM);
         APP("frame_per_sec_now=%s\n", rdline(pp, v, sizeof v) == 0 ? v : "n/a");
     }
@@ -1449,6 +1594,52 @@ static void run_cmd(const char *line, char *out, size_t n) {
         return;
     }
     if (!strcmp(cmd, "version")) { snprintf(out, n, "%s (%d)\n", APP_VER, APP_VC); return; }
+    // 只读探测：只报告路径与可写性，不写任何系统节点、不落状态
+    if (!strcmp(cmd, "probe")) {
+        size_t off = 0;
+#define PAPP(...) do { if (off < n) off += (size_t)snprintf(out + off, n - off, __VA_ARGS__); } while (0)
+        PAPP("version=%s\n", APP_VER);
+        PAPP("cgroup_root=%s\n", P_CGRP);
+        PAPP("cset_node=%s\n", g_cset_node);
+        PAPP("cpuctl_root=%s\n", P_CPUCTL);
+        {
+            char p2[PATH_MAX];
+            bg_cpus_path(p2, sizeof p2);
+            PAPP("bg_cpus=%s %s\n", p2, access(p2, W_OK) == 0 ? "W" : "-");
+            snprintf(p2, sizeof p2, "%s/background/%s", P_CGRP, g_cset_node);
+            char v2[64];
+            PAPP("bg_cpus_val=%s\n", rdline(p2, v2, sizeof v2) == 0 ? v2 : "?");
+            snprintf(p2, sizeof p2, "%s/top-app/cgroup.procs", P_CGRP);
+            char buf2[2048];
+            int got = read_all(p2, buf2, sizeof buf2);
+            int lines = 0;
+            if (got > 0) for (char *q = buf2; *q; q++) if (*q == '\n') lines++;
+            PAPP("topapp_procs=%d read=%d\n", lines, got);
+            static const char *ug[] = {"top-app", "foreground", "background"};
+            for (int i = 0; i < 3; i++) {
+                snprintf(p2, sizeof p2, "%s/%s/cpu.uclamp.max", P_CPUCTL, ug[i]);
+                PAPP("uclamp_%s=%s\n", ug[i], access(p2, W_OK) == 0 ? "W" : "-");
+            }
+        }
+        PAPP("refresh=%dHz\n", g_refresh);
+        PAPP("hmbird_dir=%d\n", g_hb_present);
+        {
+            char p2[PATH_MAX], v2[64];
+            snprintf(p2, sizeof p2, "%s/frame_per_sec", P_HM);
+            PAPP("frame_per_sec=%s\n", rdline(p2, v2, sizeof v2) == 0 ? v2 : "?");
+            snprintf(p2, sizeof p2, "%s/prefer_cpu", P_HM);
+            char bb[1024];
+            PAPP("prefer_cpu_entries=%s\n",
+                 read_all(p2, bb, sizeof bb) > 0 ? "readable" : "unreadable");
+        }
+        PAPP("rules=%d\n", g_nrules);
+        PAPP("fg=%s\n", ({ static char f[256]; foreground_pkg(f, sizeof f); f; }));
+        PAPP("perf=%s cap=%ld/%ld\n", idx_perf >= 0 ? pol[idx_perf].path : "-",
+             idx_perf >= 0 ? policy_cap_now(idx_perf) : 0,
+             idx_perf >= 0 ? pol[idx_perf].max : 0);
+#undef PAPP
+        return;
+    }
     snprintf(out, n, "err=unknown_cmd\n");
 }
 

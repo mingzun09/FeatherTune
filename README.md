@@ -10,7 +10,7 @@
 - ROOT：KernelSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.2.2 · versionCode 10004 · C 静态守护进程（193 KB，零依赖）
+> v1.2.3 · versionCode 10005 · C 静态守护进程（193 KB，零依赖）
 
 ![首页](shots/1home-light.png)
 
@@ -113,7 +113,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.2.2.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.2.3.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -134,26 +134,33 @@ sh $ctl doctor            # 环境诊断（提 issue 请附这个）
 sh $ctl mode battery      # auto/daily/battery/game/perf/sleep
 sh $ctl set intensity 70  # 省电强度
 sh $ctl pkg add com.xxx.yyy
+sh $ctl probe             # 只读探测：路径/节点/刷新率/前台，不写任何系统节点
 sh $ctl restore           # 立刻还原
 sh $ctl restart
 ```
 
 ---
 
-## 六、已知问题（欢迎提 PR）
+## 六、真机适配（v1.2.3 修完的）
 
-真机（OnePlus 15 / ColorOS 16）上 doctor 目前会看到：
+在 PLK110 / Android 17 / 内核 6.12.69 上实测，v1.2.2 的 doctor 暴露出三处"路径假设错误"，
+v1.2.3 全部改掉并用只读 `probe` 验证：
 
-| 现象 | 原因 | 现状 |
-|---|---|---|
-| `selftest prefer_cluster=FAIL` / `prefer_cpu=FAIL` | `/proc/sys/hmbird_II/prefer_*` 写入被拒 | v1.2.2 起 doctor 打印 `prefer_errno=` 定位是 SELinux 还是格式；失败时降级到单核亲和（单核掩码 hmbird 会尊重） |
-| `refresh=0Hz` | 该机型不允许读 `fb0/modes` | `frame_per_sec` 保持内核默认 120；可在 `config.ini` 里显式写 `hmbird_frame_per_sec=165` |
-| `fg=-` `cand=0` | cgroup 布局与标准路径不同 | v1.2.2 起 doctor 打印 `cgroup_root` 探针与 `/proc/self/cgroup`，据此再适配 |
-| `bg_cpuset=n/a` | `background/cpuset.cpus` 不存在 | 同上，探针会指出实际路径 |
+| 项 | v1.2.2 的假设 | 真机实际 | 现状 |
+|---|---|---|---|
+| cpuset 根 | `/sys/fs/cgroup` | **`/dev/cpuset`**（v1 语义，节点名 `cpus` 而不是 `cpuset.cpus`） | 自动探测，`probe` 输出 `cgroup_root=/dev/cpuset cset_node=cpus` |
+| uclamp | `cpuset` 下的 `cpu.uclamp.max` | **`/dev/cpuctl/<group>/cpu.uclamp.max`**，读回是 `max` / `0.00` 百分数形式 | 独立探测根；写入后读回校验，格式不符就整体停用并写日志，不盲猜 |
+| 刷新率 | `fb0/modes` | 该节点不存在；真实来源是 **`/sys/class/drm/card0-DSI-1/modes`**（含 `…x165cmd`） | 新增 DRM 扫描，取最大刷新率 → `refresh=165Hz` |
+| `prefer_cpu` / `prefer_cluster` 自检 | 写入后按原文比对 | 内核 show 回调输出的是 `<leader>::<comm>::<hex>` 列表，**原文永远对不上** | 改为按"值是否出现"判定，测完写 0 清理自己的条目 |
 
-这些问题不影响日常档/省电档生效，但会让**游戏档的线程归位退化**。
+第四条是重点：v1.2.2 报 `selftest prefer_cpu=FAIL` 是**假阴性**——真机上 `cat /proc/sys/hmbird_II/prefer_cluster`
+能看到 `feather::feather::2`，说明写入一直是成功的。
 
----
+### 仍待观察
+
+- `background/cpus` 游戏档收窄到 `0-3`（厂商默认 `0-5`）：需要实测确认不会把后台的音频/网络挤爆
+- `prefer_preempt`：hmbird 的调度属性位，行为在 BPF 里，源码只能看到置位；`rules.conf` 里可用
+  `preempt` / `idle` 作为目标，默认不启用，等 A/B 数据
 
 ## 七、构建与测试
 
