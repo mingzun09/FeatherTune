@@ -1,0 +1,23 @@
+# 构建产物与发布包
+dist/
+
+# 下载/抓取的上游源码与数据集（体积大、且属于上游，只保留分析结论在 docs/）
+research/
+
+# 测试临时文件
+tests/fake/
+tests/data/
+tests/*.trace
+tests/tmp/
+
+# 本地调试脚本生成的产物
+shots/*.tmp
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+*.o
+*.obj
+*.exe
+__pycache__/
+*.pyc

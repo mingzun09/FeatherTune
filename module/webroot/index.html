@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>羽量调校</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ================= 顶部 ================= -->
+  <header class="topbar">
+    <div class="topbar-txt">
+      <h1>羽量调校</h1>
+      <p id="subtitle">FeatherTune · 正在读取设备…</p>
+    </div>
+    <button class="icon-btn" id="themeBtn" aria-label="主题">
+      <svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"/></svg>
+    </button>
+  </header>
+
+  <div id="mockbar" class="mockbar hidden">演示模式：未检测到 KernelSU 接口，数据为示例</div>
+
+  <div class="chips"><span class="chip" id="statusline">未连接</span></div>
+
+  <div class="card blocker hidden" id="blocker">
+    <div class="blocker-head">
+      <svg viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 10v5M12 18h.01"/></svg>
+      <b>连接不上守护进程</b>
+    </div>
+    <p class="hint" id="blockerMsg">—</p>
+    <ul class="blocker-list">
+      <li>KernelSU Next / SukiSU / MMRL：设置 → 超级用户 → 允许 WebUI 调用 shell（高级 API）</li>
+      <li>BakaSU 等禁用了 exec 的版本：直接用浏览器打开 <code>http://127.0.0.1:7891/</code></li>
+      <li>确认模块已安装并重启过；或执行 <code>su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh status'</code></li>
+    </ul>
+    <button class="text-btn" id="btnRetry">重新连接</button>
+  </div>
+
+  <!-- ================= 概览 ================= -->
+  <section class="tab" id="tab-home">
+    <div class="hero card" id="hero">
+      <div class="hero-top">
+        <div>
+          <span class="hero-label">当前场景</span>
+          <div class="hero-name" id="profileName">日常</div>
+        </div>
+        <span class="pill" id="runPill"><i class="dot"></i><span>运行中</span></span>
+      </div>
+      <div class="hero-stats">
+        <div class="hs"><b id="capPerf">—</b><span>性能簇上限</span></div>
+        <div class="hs"><b id="capPrime">—</b><span>超大核上限</span></div>
+        <div class="hs"><b id="govText">—</b><span>调速器</span></div>
+      </div>
+    </div>
+
+    <div class="metrics">
+      <div class="metric card">
+        <svg class="mi" viewBox="0 0 24 24"><rect x="2" y="7" width="17" height="10" rx="3"/><path d="M21 10v4"/></svg>
+        <b id="mBattery">—</b><span>电量</span>
+      </div>
+      <div class="metric card">
+        <svg class="mi" viewBox="0 0 24 24"><path d="M14 14V5a2 2 0 0 0-4 0v9a4 4 0 1 0 4 0Z"/></svg>
+        <b id="mTemp">—</b><span>电池温度</span>
+      </div>
+      <div class="metric card">
+        <svg class="mi" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8"/></svg>
+        <b id="mFg">—</b><span>前台应用</span>
+      </div>
+    </div>
+
+    <div class="section-title">快捷操作</div>
+    <div class="group card">
+      <div class="row">
+        <div class="row-main"><span class="row-title">自动识别游戏</span><span class="row-sub">命中名单即切游戏场景</span></div>
+        <label class="switch"><input type="checkbox" data-key="auto_game"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">熄屏省电</span><span class="row-sub">锁屏后压到最低档</span></div>
+        <label class="switch"><input type="checkbox" data-key="screen_off_saver"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">线程归位</span><span class="row-sub">渲染线程留大核，音频下沉</span></div>
+        <label class="switch"><input type="checkbox" data-key="thread_opt"><i></i></label>
+      </div>
+    </div>
+
+    <div class="section-title">运行状态</div>
+    <div class="group card">
+      <div class="row">
+        <div class="row-main"><span class="row-title">守护进程</span></div>
+        <span class="val" id="stRunner">—</span>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">风驰协同</span><span class="row-sub">游戏时改写 hmbird 系数</span></div>
+        <span class="val" id="stHm">—</span>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">已关闭厂商 boost</span><span class="row-sub">触控/输入频率冲刺</span></div>
+        <span class="val" id="stBoost">—</span>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">WebUI 通道</span><span class="row-sub">内核接口 / 本机端口</span></div>
+        <span class="val" id="stTransport">—</span>
+      </div>
+    </div>
+
+    <div class="card note">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
+      <p>游戏里若 Oplus 风驰（hmbird）已接管调速器，本模块会自动让出频率控制权，只改系数与线程归位，避免两套逻辑互相打架。</p>
+    </div>
+  </section>
+
+  <!-- ================= 场景 ================= -->
+  <section class="tab hidden" id="tab-scene">
+    <div class="segwrap">
+      <div class="seg" id="modeSeg">
+        <button data-mode="auto" class="on">自动</button>
+        <button data-mode="daily">日常</button>
+        <button data-mode="battery">省电</button>
+        <button data-mode="game">游戏</button>
+        <button data-mode="perf">满速</button>
+      </div>
+    </div>
+
+    <div class="card slider-card">
+      <div class="slider-head">
+        <span class="row-title">省电强度</span>
+        <span class="slider-val" id="intVal">50</span>
+      </div>
+      <input type="range" id="intensity" min="0" max="100" step="5" value="50">
+      <div class="slider-legend"><span>更流畅</span><span>更省电</span></div>
+      <p class="hint">强度只作用于日常/省电/熄屏，游戏场景不受影响。</p>
+    </div>
+
+    <div class="section-title">场景频率上限</div>
+    <div class="card table" id="sceneTable">
+      <div class="tr th"><span>场景</span><span>性能簇</span><span>超大核</span></div>
+      <div id="sceneRows"></div>
+    </div>
+
+    <div class="section-title">其它</div>
+    <div class="group card">
+      <div class="row">
+        <div class="row-main"><span class="row-title">关闭厂商触控加速</span><span class="row-sub">省掉每次点击的频率冲刺</span></div>
+        <label class="switch"><input type="checkbox" data-key="kill_boost"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">启动瞬间放开</span><span class="row-sub">切 App 后 4 秒内不压频</span></div>
+        <label class="switch"><input type="checkbox" data-key="launch_boost"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">I/O 预读优化</span><span class="row-sub">read_ahead 256K，关 iostats</span></div>
+        <label class="switch"><input type="checkbox" data-key="io_tune"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">GPU 省电</span><span class="row-sub">关闭常开时钟与总线分离</span></div>
+        <label class="switch"><input type="checkbox" data-key="gpu_tune"><i></i></label>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 游戏 ================= -->
+  <section class="tab hidden" id="tab-game">
+    <div class="card game-head">
+      <div>
+        <span class="row-title">已加入游戏名单</span>
+        <p class="hint" id="gameCount">— 个应用</p>
+      </div>
+      <button class="text-btn" id="addGameBtn">添加应用</button>
+    </div>
+
+    <div class="searchbar" id="gameSearchWrap">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="gameSearch" placeholder="搜索包名">
+    </div>
+
+    <div class="group card list" id="gameList"></div>
+
+    <div class="section-title">线程归位规则</div>
+    <div class="card codebox">
+      <div id="rulesView" class="rules">读取中…</div>
+    </div>
+    <div class="card note">
+      <svg viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4"/><circle cx="12" cy="12" r="3"/></svg>
+      <p>hmbird 激活时会把任务核掩码扩大，普通绑核会被它覆盖，因此这里优先写 hmbird 的 <code>prefer_cpu</code>；未被接管时才回落到 taskset。</p>
+    </div>
+  </section>
+
+  <!-- ================= 设置 ================= -->
+  <section class="tab hidden" id="tab-settings">
+    <div class="group card">
+      <button class="row btn-row" id="btnRestart"><div class="row-main"><span class="row-title">重启守护进程</span><span class="row-sub">改动异常时用</span></div><svg class="chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></button>
+      <button class="row btn-row" id="btnRestore"><div class="row-main"><span class="row-title">还原频率与参数</span><span class="row-sub">立刻停手，不留限频</span></div><svg class="chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></button>
+      <button class="row btn-row" id="btnDoctor"><div class="row-main"><span class="row-title">环境诊断</span><span class="row-sub">节点/调速器/hmbird 全量检测</span></div><svg class="chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></button>
+      <button class="row btn-row" id="btnLog"><div class="row-main"><span class="row-title">查看日志</span><span class="row-sub">最近 60 行</span></div><svg class="chev" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></button>
+    </div>
+
+    <div class="card codebox" id="outputBox" hidden><pre id="output"></pre></div>
+
+    <div class="section-title">关于</div>
+    <div class="card about">
+      <p><b>羽量调校 FeatherTune v1.2.1</b></p>
+      <p class="hint">面向 OnePlus 15 / SM8850 的场景化功耗调校。C 守护进程常驻（1Hz，零 fork），日常按负载收紧频率上限并压制厂商 boost；游戏场景与 Oplus 风驰协同，接管线程归位与调速器系数。</p>
+      <p class="hint">兼容 Android 15–17 · KernelSU / Magisk / APatch · 元模块环境<br>WebUI 双通道：内核接口 / <code>http://127.0.0.1:7891/</code></p>
+    </div>
+  </section>
+
+  <!-- ================= 底部导航 ================= -->
+  <nav class="tabbar">
+    <button class="tabbtn on" data-tab="home">
+      <svg viewBox="0 0 24 24"><path d="M4 11 12 4l8 7v8a1 1 0 0 1-1 1h-5v-6H10v6H5a1 1 0 0 1-1-1Z"/></svg><span>概览</span>
+    </button>
+    <button class="tabbtn" data-tab="scene">
+      <svg viewBox="0 0 24 24"><path d="M4 17c3-6 5-9 8-9s5 3 8 9"/><path d="M4 20h16"/></svg><span>场景</span>
+    </button>
+    <button class="tabbtn" data-tab="game">
+      <svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="4"/><path d="M8 10v4M6 12h4M16 11h.01M18 13h.01"/></svg><span>游戏</span>
+    </button>
+    <button class="tabbtn" data-tab="settings">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2 2M16.4 16.4l2 2M18.4 5.6l-2 2M7.6 16.4l-2 2"/></svg><span>设置</span>
+    </button>
+  </nav>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

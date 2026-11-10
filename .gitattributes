@@ -1,0 +1,19 @@
+# 仓库里的脚本必须在 Android 上以 LF 运行，不能被 Windows 检出成 CRLF
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.conf text eol=lf
+*.ini  text eol=lf
+*.prop text eol=lf
+*.c    text eol=lf
+*.js   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.md   text eol=lf
+*.py   text eol=lf
+
+# 二进制
+module/bin/feather binary
+*.png  binary
+*.jpg  binary
+*.zip  binary
