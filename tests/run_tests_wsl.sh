@@ -143,21 +143,45 @@ check "超大核已压 < max"          '[ "${PR:-0}" -lt 4608000 ] && [ "${PR:-0
 check "退出游戏后 min 频还原"    'grep -qx 300000 "$FAKE/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"' "$(cat "$FAKE/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq")"
 check "后台 cpuset 还原"          'grep -qx "0-7" "$FAKE/sys/fs/cgroup/background/cpuset.cpus"' "$(cat "$FAKE/sys/fs/cgroup/background/cpuset.cpus")"
 
-echo "== 5.5 充电控制（方案 A）=="
+echo "== 5.5 充电控制（方案 A：0~67% 满功率 + 到墙降档）=="
 PS="$FAKE/sys/class/power_supply/battery"
-echo 70 > "$PS/capacity"; echo 390 > "$PS/temp"; echo Charging > "$PS/status"
+
+# 1) 拐点以下：完全不干预，必须跑满
+echo 50 > "$PS/capacity"; echo 360 > "$PS/temp"; echo Charging > "$PS/status"
+sleep 3
+check "SOC 50% 36℃ → 满电流不干预" 'grep -qx 6000000 "$PS/constant_charge_current_max"' "cur=$(cat "$PS/constant_charge_current_max")"
+
+# 2) 到 50℃ 温度墙：降一档（75% ≈ 90W），不是暂停
+echo 500 > "$PS/temp"
 sleep 3
 CUR=$(cat "$PS/constant_charge_current_max")
-check "SOC>67 且 39℃ → 落到 85% 档" '[ "$CUR" -le 5200000 ] && [ "$CUR" -ge 4900000 ]' "cur=$CUR"
-echo 440 > "$PS/temp"
+check "50℃ 到墙 → 降一档 75%"  '[ "$CUR" = "4500000" ]' "cur=$CUR"
+check "此时未暂停充电"          'grep -qx 0 "$PS/input_suspend"' "suspend=$(cat "$PS/input_suspend")"
+
+# 3) 52℃：再降一档（50% ≈ 60W）
+echo 520 > "$PS/temp"
 sleep 3
-check "44℃ 到温度墙 → 暂停充电" 'grep -qx 1 "$PS/input_suspend"' "suspend=$(cat "$PS/input_suspend")"
-echo 400 > "$PS/temp"
+CUR=$(cat "$PS/constant_charge_current_max")
+check "52℃ → 再降一档 50%"     '[ "$CUR" = "3000000" ]' "cur=$CUR"
+
+# 4) 54℃：安全线，暂停
+echo 540 > "$PS/temp"
 sleep 3
-check "回到 40℃ → 恢复充电" 'grep -qx 0 "$PS/input_suspend"' "suspend=$(cat "$PS/input_suspend")"
-echo 50 > "$PS/capacity"; echo 360 > "$PS/temp"
+check "54℃ 安全线 → 暂停"      'grep -qx 1 "$PS/input_suspend"' "suspend=$(cat "$PS/input_suspend")"
+
+# 5) 回落 45℃：恢复满档
+echo 450 > "$PS/temp"
 sleep 3
-check "SOC<67 → 不干预(满电流)" 'grep -qx 6000000 "$PS/constant_charge_current_max"' "cur=$(cat "$PS/constant_charge_current_max")"
+check "回到 45℃ → 恢复充电"    'grep -qx 0 "$PS/input_suspend"' "suspend=$(cat "$PS/input_suspend")"
+check "回到 45℃ → 满电流"      'grep -qx 6000000 "$PS/constant_charge_current_max"' "cur=$(cat "$PS/constant_charge_current_max")"
+
+# 6) 拐点以上：按温度曲线降（39℃ → 88%）
+echo 70 > "$PS/capacity"; echo 390 > "$PS/temp"
+sleep 3
+CUR=$(cat "$PS/constant_charge_current_max")
+check "SOC 70% 39℃ → 曲线 88%"  '[ "$CUR" -ge 5200000 ] && [ "$CUR" -le 5350000 ]' "cur=$CUR"
+
+# 7) 停止充电：还原
 echo Discharging > "$PS/status"
 sleep 2
 check "停止充电 → 还原原始电流" 'grep -qx 6000000 "$PS/constant_charge_current_max"' "cur=$(cat "$PS/constant_charge_current_max")"

@@ -42,8 +42,8 @@
 #define PATH_MAX 4096
 #endif
 
-#define APP_VER   "v1.2.6"
-#define APP_VC    10008
+#define APP_VER   "v1.2.7"
+#define APP_VC    10009
 #define MAX_FREQ  64
 #define MAX_POL   4
 #define MAX_RULES 64
@@ -448,9 +448,9 @@ static void cfg_defaults(void) {
     snprintf(C.hm_coeff, sizeof C.hm_coeff, "1152,1024");
     snprintf(C.hm_high, sizeof C.hm_high, "56,60");
     snprintf(C.hm_heavy, sizeof C.hm_heavy, "0,360,128");
-    C.charge_ctrl = 1; C.charge_knee_soc = 67; C.charge_temp_wall = 43;
-    C.charge_resume_temp = 40;
-    snprintf(C.chg_curve, sizeof C.chg_curve, "36:100,38:85,40:70,42:50,43:0");
+    C.charge_ctrl = 1; C.charge_knee_soc = 67; C.charge_temp_wall = 50;
+    C.charge_resume_temp = 45;
+    snprintf(C.chg_curve, sizeof C.chg_curve, "36:100,38:88,40:78,42:66,44:55,50:50");
 }
 
 static int atoi_safe(const char *s, int def) {
@@ -665,6 +665,7 @@ static int  g_chg_ready;            // 节点已探测
 static int  g_chg_active;           // 当前正被我们接管
 static int  g_chg_suspended;
 static int  g_chg_last_pct = -1;    // 上次设置的百分比
+static int  g_chg_gear;             // 0=满档，1/2=降档，3=暂停
 static long g_chg_orig_cur;         // 原始电流值（用于按比例算）
 
 // 候选节点：不同 ColorOS 版本开放的不一样，按顺序挑第一个可写的
@@ -715,7 +716,30 @@ static void charge_init(void) {
          g_chg_cur.path, g_chg_cur.orig, g_chg_suspend.valid ? g_chg_suspend.path : "无");
 }
 
-// "36:100,38:85,40:70,42:50,43:0" —— 按温度升序，取第一个 t >= 对应温度的点
+/* 温度阶梯（相对温度墙）：
+ *   墙-5 以下 → 回到满档
+ *   ≥ 墙       → 降一档（默认 75%，约 120W→90W）
+ *   ≥ 墙+2     → 再降一档（默认 50%，约 60W）
+ *   ≥ 墙+4     → 暂停（保护）
+ * 档位只朝一个方向走到阈值，避免在边界反复横跳。
+ */
+static int gear_pct(int gear) {
+    if (gear <= 0) return 100;
+    if (gear == 1) return 75;
+    if (gear == 2) return 50;
+    return 0;                       // 3 = 暂停
+}
+
+static int gear_for_temp(long t) {
+    int wall = C.charge_temp_wall;
+    if (t >= wall + 4) return 3;
+    if (t >= wall + 2 && g_chg_gear < 2) return 2;
+    if (t >= wall && g_chg_gear < 1) return 1;
+    if (t <= wall - 5) return 0;
+    return g_chg_gear;              // 维持当前档
+}
+
+// "36:100,38:88,40:78,42:66" —— 按温度升序，取最后一个 <= 当前温度的点
 static int charge_pct_for_temp(long temp) {
     int pct = 100;
     char buf[128];
@@ -776,24 +800,39 @@ static void charge_tick(void) {
     if (soc <= 0) return;
     g_chg_active = 1;
 
-    if (temp >= C.charge_temp_wall) {
-        if (!g_chg_suspended)
-            logmsg("charge: %.0f℃ 到温度墙 %d℃，暂停充电", (double)temp, C.charge_temp_wall);
+    // 1) 温度阶梯：到墙才降档，不是一碰就停
+    int g = gear_for_temp(temp);
+    if (g != g_chg_gear) {
+        int old = g_chg_gear;
+        g_chg_gear = g;
+        if (g == 3)
+            logmsg("charge: %.0f℃ 超过安全线 %d℃，暂停充电", (double)temp, C.charge_temp_wall + 4);
+        else if (g == 0)
+            logmsg("charge: %.0f℃ 回落到 %d℃ 以下，恢复满档", (double)temp, C.charge_temp_wall - 5);
+        else
+            logmsg("charge: %.0f℃ 到温度墙 %d℃，降档 %d%% → %d%%（约 %dW）",
+                   (double)temp, C.charge_temp_wall, gear_pct(old), gear_pct(g),
+                   120 * gear_pct(g) / 100);
+    }
+    if (g_chg_gear == 3) {
         charge_suspend(1);
         charge_set_pct(0);
         return;
     }
     if (g_chg_suspended) {
-        if (temp > C.charge_resume_temp) return;     // 还没凉到恢复线
-        logmsg("charge: 回到 %.0f℃（恢复线 %d℃），恢复充电", (double)temp, C.charge_resume_temp);
+        logmsg("charge: 恢复充电（档位 %d%%）", gear_pct(g_chg_gear));
         charge_suspend(0);
     }
 
+    // 2) 电量区间：拐点以下满功率（除非温度档位要求更低）
     int pct = 100;
     if (soc >= C.charge_knee_soc) pct = charge_pct_for_temp(temp);
+    int cap = gear_pct(g_chg_gear);
+    if (cap < pct) pct = cap;
+
     if (pct != g_chg_last_pct)
-        logmsg("charge: SOC %ld%% %.0f℃ → 电流上限 %d%%（拐点 %d%%）",
-               soc, (double)temp, pct, C.charge_knee_soc);
+        logmsg("charge: SOC %ld%% %.0f℃ → 电流上限 %d%%（拐点 %d%%，温度档 %d%%）",
+               soc, (double)temp, pct, C.charge_knee_soc, cap);
     charge_set_pct(pct);
 }
 
@@ -809,6 +848,7 @@ static void charge_restore(void) {
     }
     g_chg_active = 0;
     g_chg_last_pct = -1;
+    g_chg_gear = 0;
 }
 
 // ------------------------------------------------------------------ hmbird --
@@ -1872,6 +1912,7 @@ static void cmd_status(char *out, size_t n) {
     APP("cfg_charge_ctrl=%d\n", C.charge_ctrl);
     APP("chg_last_pct=%d\n", g_chg_last_pct);
     APP("chg_suspend=%d\n", g_chg_suspended);
+    APP("chg_gear=%d\n", g_chg_gear);
     APP("chg_node=%s\n", g_chg_cur.valid ? g_chg_cur.path : "-");
     APP("games=%d\n", g_ngames);
     APP("version=%s\n", APP_VER);

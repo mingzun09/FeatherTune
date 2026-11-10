@@ -286,11 +286,11 @@ function render() {
     } else if (suspended) {
       chgEl.textContent = '已暂停';
       chgEl.classList.add('on');
-      $('#chgSub').textContent = `${soc}% · ${temp}℃ 达到温度墙`;
+      $('#chgSub').textContent = `${soc}% · ${temp}℃ 超过安全线，已暂停`;
     } else if (pct >= 0 && pct < 100) {
       chgEl.textContent = pct + '%';
       chgEl.classList.add('on');
-      $('#chgSub').textContent = `${soc}% · ${temp}℃ 限流中`;
+      $('#chgSub').textContent = `${soc}% · ${temp}℃ 降档中（${pct}%）`;
     } else {
       chgEl.textContent = '全功率';
       chgEl.classList.remove('on');

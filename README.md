@@ -10,7 +10,7 @@
 - ROOT：KernelSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.2.6 · versionCode 10008 · C 静态守护进程（193 KB，零依赖）
+> v1.2.7 · versionCode 10009 · C 静态守护进程（193 KB，零依赖）
 
 ![首页](shots/1home-light.png)
 
@@ -93,9 +93,14 @@ com.netease.cloudmusic  custom 70 60 20 0
 
 | 区间 | 行为 |
 |---|---|
-| SOC < 67% | **完全不干预**，让厂商曲线全功率跑（这段电池本身不热） |
-| SOC ≥ 67% | 按电池温度查表降电流上限：`36:100,38:85,40:70,42:50` |
-| 温度 ≥ 43℃ | 暂停充电；回落到 40℃ 再恢复 |
+| SOC < 67% | **完全不干预**，让原厂 120W 跑满 |
+| SOC ≥ 67% | 按温度曲线降电流：`36:100 38:88 40:78 42:66 44:55` |
+| 温度 ≥ 50℃（默认墙） | **降一档**：120W → 90W（不暂停） |
+| 温度 ≥ 52℃ | 再降一档：→ 60W |
+| 温度 ≥ 54℃ | 暂停充电（安全线） |
+| 温度 ≤ 45℃ | 回满档 |
+
+降档是**阶梯式**的：到墙只降一档，继续升温才再降，冷却到墙下 5℃ 才回满——避免在阈值上反复横跳。
 
 - 作用点是充电 IC 的输入/恒流上限，**SVOOC / UFCS / PPS 三种协议同时生效**（都要经过这里）
 - 只能降不能升：系统因温度降了功率，我们没法加回去
@@ -159,7 +164,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.2.6.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.2.7.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -229,7 +234,7 @@ aarch64-linux-gnu-gcc -Os -s -static -Wno-format-truncation -Wno-unused-result \
   -o module/bin/feather src/feather.c
 
 # 端到端测试：假 /sys /proc /cgroup 树 + 真实 arm64 二进制（binfmt/qemu-user）
-FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 47 项
+FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 51 项
 
 # 打包
 python build.py
@@ -239,7 +244,7 @@ python build.py
 src/feather.c          单文件 C 守护进程（daemon + CLI + socket + HTTP + WebUI 托管）
 module/                Magisk/KSU/APatch 模块骨架（含 webroot/）
 module/bin/shell/      v1.0 的 shell 实现，仅作二进制跑不起来时的兜底
-tests/                 47 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
+tests/                 51 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
 docs/DESIGN.md         设计取舍、源码分析、每一轮实测复盘
 ```
 
