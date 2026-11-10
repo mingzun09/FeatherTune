@@ -21,3 +21,9 @@ Thumbs.db
 *.exe
 __pycache__/
 *.pyc
+
+# 测试编译产物
+tests/feather_x86
+
+# 一次性推送脚本（网络受限时用 REST API 代替 git push）
+tools/push_via_api.py
