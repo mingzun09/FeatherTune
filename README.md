@@ -7,10 +7,10 @@
 让给 Oplus 风驰（`hmbird` / sched_ext），只做它管不到的事——线程归位与帧预算对齐。
 
 - 适配：Android 15 / 16 / 17（ARM64）
-- ROOT：KernelSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
+- ROOT：KernelSU / SukiSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.2.8 · versionCode 10010 · C 静态守护进程（193 KB，零依赖）
+> v1.4.7 · versionCode 10024 · Rust 静态守护进程（1.5 MB，零依赖、零 fork）
 
 ![首页](shots/1home-light.png)
 
@@ -43,10 +43,11 @@ v1.2 是单个静态 arm64 二进制（`bin/feather`）：1 Hz 轮询、热路�
 |---|---|
 | 频率上限 | 按簇百分比：日常 72% / 超大核 62%，省电 50%/45%，熄屏 30%/25%（随“省电强度”浮动） |
 | uclamp | 后台 30%、前台 55%、top-app 不限；熄屏 20~30% |
-| 厂商 boost | 关 touch/input boost、`sched_boost`、`cpu_boost` 等节点 |
+| 厂商 boost | 关 touch/input boost（含 WALT 的 `/proc/sys/walt/input_boost_ms`、`sched_boost_on_input`、`sched_boost`）、`sched_boost`、`cpu_boost` 等节点，退出逐节点还原 |
 | 启动瞬开 | 切 App 后 4 秒内临时放开（100%/92%），避免“点开卡一下” |
 | 漂移校正 | 厂商 thermal 改写上限后 10 秒内自动纠正 |
 | 基线保护 | 只快照一次原始上限/下限，退出或卸载只还原到“动手前”，绝不抬高别人设的值 |
+| 守护进程自身 | 钉在性能簇（cpu0-5，`daemon_pin=1`）：1Hz 轮询与子进程都不把超大核拉出低频 |
 | I/O / GPU | read_ahead 256K、关 iostats；GPU `force_clk_on=0`、`bus_split=1` |
 
 ### 游戏（game）
@@ -84,8 +85,17 @@ WebUI 第二个 tab 从「游戏名单」升级成**应用管理**：直接读�
 （白名单语义），自动模式下也不会被改回去。
 
 - **名称**：`labels.conf`（`包名=名称`），已内置 150+ 常见应用与游戏；你也可以自己加，改完刷新生效
-- **图标**：守护进程从 APK 里直接抠 `res/…ic_launcher*.png`（toybox 自带的 `unzip` 就够，不依赖任何工具），
-  缓存到 `/data/adb/feather/icons/`；取不到时退化成首字母色块
+- **图标**：优先用管理器原生接口——`ksu://icon/<包名>`（KernelSU/SukiSU/APatch 的 WebView 会用
+  `AppIconCache` 渲染 512px PNG，自适应图标也对），失败再回落到 daemon 抠图；名字优先系统
+  `appLabel`（`ksu.getPackagesInfo`，ColorOS 上本身就是中文），拿不到才用 `labels.conf`，最后包名末段；
+  应用列表取 `ksu.listPackages('user')` 与 daemon 的并集。
+  daemon 侧那套抠图仍然保留（浏览器直连 7891、Magisk、系统应用时用）：扫 `pm path` 全部 APK，
+  支持 PNG/WebP/JPEG，名字被混淆成 `res/ab.png` 时按文件头宽高判断（方形且 ≥48px），
+  排除透明前景层/通知栏小图/启动图；换算法后自动清旧缓存）
+
+> v1.4.4 之前的图标问题：v1.4.1 修了「全灭」（SukiSU 里 `HTTP_BASE` 判空、toybox 没有 unzip、
+> 只认 png、负缓存永不过期），v1.4.2 修了「只对一部分 / 错图」（多 APK、尺寸嗅探、缓存版本号）。
+> 细节见 [docs/FIXES_1.4.1.md](docs/FIXES_1.4.1.md) §2 与 [docs/FIXES_1.4.2.md](docs/FIXES_1.4.2.md) §1。
 
 | 选项 | 说明 |
 |---|---|
@@ -120,9 +130,96 @@ com.netease.cloudmusic  custom 70 60 20 0
 - 所有动过的节点在退出 / 卸载时还原成动手前的值
 - 配置项：`charge_ctrl` / `charge_knee_soc` / `charge_temp_wall` / `charge_resume_temp` / `charge_curve`
 
+> **v1.4.1：本机（charger v2）能做的只有「息屏限流」**
+> 一加 15 的 `battery` power_supply 里没有 `constant_charge_current_max` / `current_max` /
+> `input_suspend`，v1.2.6 那套节点全不存在（真机 `charge` 输出 `node=-`）。
+> 内核只把 `battery/current_now` 标成可写，而它是**息屏智能充电**接口：
+> 熄屏写 = 限流，亮屏写 = 取消限流（`oplus_chg_gki.c` 的 `led_on` 分支）。
+> 所以现在只在熄屏时接管、亮屏自动释放；`charge` / `doctor` 会直接告诉你本机走的是哪条。
+> 细节与「为什么亮屏限不了」见 [docs/FIXES_1.4.1.md](docs/FIXES_1.4.1.md) §3。
+
+### 充电功率显示与诊断（v1.4.2）
+
+WebUI 的「充电功率」一行同时给出**实时功率 / 峰值 / 电压×电芯 / 电流**。双电芯机型必须乘串联数：
+
+- 判定顺序：`config.ini` 的 `battery_cells`（0=自动）→ DT `oplus,batt_num`（一加 15 = 2）→
+  `voltage_max > 6V` 兜底。charger v2 的 `voltage_max` 是**单芯**电压（~4.5V），
+  旧版据此判成 1S，所以峰值只显示真实的一半。
+- `power` 现在会打印 `cells=2`；`state` 里也有 `cells=` / `chg_node=` 供 WebUI 使用。
+
+「加速到底有没有用」用一条命令看：
+
+```sh
+su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh charge why'
+```
+
+它会打印真实机身/电池温度落在 DT 的哪一段、伪装值落在哪一段、限流节点与功率，并给结论。
+还会打印 **适配器天花板**（usb `voltage_max × current_max`）、实测输入功率、以及
+**离电池温度降流线还有多少度**——67W 到底是模块没生效还是头只给这么多，一眼能分清。
+
+想验证「伪装温度到底有没有用」，直接实测扫一遍（按 DT 分桶表逐档写、读回电流）：
+
+```sh
+su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh charge sweep'       # 每档 4s
+su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh charge sweep 3000'  # 自定义等待
+```
+
+各档电流有差异会给出最优值（`set accel_tbat <值>`）；没差异就会告诉你「温度不是瓶颈」。
+细节见 [docs/CHG_EFFECT.md](docs/CHG_EFFECT.md)。
+常温下一加 15 的 `normal_high` 覆盖 21.0~37.9℃，本来就在最高电流档——**没有可提升空间**，
+只有机身发烫（≥38℃）时伪装才会换段生效。证据见 [docs/FIXES_1.4.2.md](docs/FIXES_1.4.2.md) §3。
+
 ```sh
 su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh charge probe'   # 看这台机器开放了哪个节点
 ```
+
+### 充电加速（v1.3.1，按内核源码修正）
+
+翻 `vendor/oplus/kernel/charger/v2/` 后的结论：UFCS/PPS 的电流**不是**由“降额等级”给的，而是由
+「温度分桶曲线」给的（`strategy/oplus_strategy_pps_ufcs_curve.c`）：
+
+```
+puc_get_temp_region(): 取第一个 temp < range[i] 的 i，段号 = i-1
+6 段：little_cold / cool / little_cool / normal_low / normal_high / warm
+标准表 {-50,0,50,100,160,250,350}（0.1℃） → normal_high = [160,250) = 16.0~24.9℃
+```
+
+**温度一旦进 warm 段，整条曲线降流**。所以：
+
+| 写法 | 落点 | 结果 |
+|---|---|---|
+| 写 360（36.0℃，闭源模块的值） | warm 段 | 功率被限，真机表现就是「上不去」，甚至比原厂更慢 |
+| 写 300（30.0℃） | 不少机型也在 warm 段 | 同上 |
+| 自动档（默认） | 读 DT `oplus,temp_range`，取 normal_high 段起点 +1℃ | 曲线落到最高电流那一段 |
+
+内核侧两个可写参数（都是 `module_param`，0644，无鉴权）：
+
+| 参数 | 归属 | 语义 |
+|---|---|---|
+| `oplus_dbg_tbat` | v2 `oplus_chg_comm.c` | 覆盖**机身温度** `shell_temp`（曲线默认就用它）← 本模块用这个 |
+| `gauge_dbg_tbat` | gauge | 覆盖**电池温度**（连保护一起骗，默认不碰） |
+
+行为与安全：
+
+| 条件 | 行为 |
+|---|---|
+| 充电中，真实电池温度 < 45℃ | 写 `oplus_dbg_tbat` = 自动算出的值（normal_high 段内） |
+| 真实电池温度 ≥ 45℃ | **立刻写回原值**，交限流阶梯继续降档 |
+| 回落到 ≤ 42℃ | 重新接管 |
+| 拔线 / 充满 / `accel_ctrl=0` / `enable=0` / 守护退出 / 卸载 | 一律还原原值 |
+
+> 一加 15 的真机 DT 是 `oplus,temp_range = <0 50 120 160 210 380 440>`，
+> normal_high 实际是 **21.0~37.9℃**。常温机身本来就在这一段里，所以「加速」只在
+> 机身发烫（≥38℃，进 warm 段）时才有增益——这不是 bug，是这台机器的分桶表。
+
+```sh
+su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh charge'      # 看 node/target/dt/spoofing
+su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh set accel_tbat 200'  # 自动档没效果再手调
+su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh set accel_ctrl 0'    # 只想限流不要加速
+```
+
+> 只在「没有 `oplus_dbg_tbat`、只有 `gauge_dbg_tbat`」的机器上，才需要 `accel_gauge=1`；
+> 那会把电池温度一起伪装，保护也一起被骗，默认关。
 
 ### 线程规则（`rules.conf`）
 
@@ -177,7 +274,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.2.8.zip`，在 KernelSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.4.7.zip`，在 KernelSU / SukiSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -217,7 +314,7 @@ v1.2.3 全部改掉并用只读 `probe` 验证：
 | 刷新率 | `fb0/modes` | 该节点不存在；真实来源是 **`/sys/class/drm/card0-DSI-1/modes`**（含 `…x165cmd`） | 新增 DRM 扫描，取最大刷新率 → `refresh=165Hz` |
 | `prefer_cpu` / `prefer_cluster` 自检 | 写入后按原文比对 | 内核 show 回调输出的是 `<leader>::<comm>::<hex>` 列表，**原文永远对不上** | 改为按"值是否出现"判定，测完写 0 清理自己的条目 |
 
-第四条是重点：v1.2.2 报 `selftest prefer_cpu=FAIL` 是**假阴性**——真机上 `cat /proc/sys/hmbird_II/prefer_cluster`
+第四条是重点：v1.2.2 报 `selftest prefer_cpu=FAIL` 是**假阴性**——真机上 `cat /proc/sys/hmbird_II/prefer_cpu`
 能看到 `feather::feather::2`，说明写入一直是成功的。
 
 ### 前台应用是怎么认的（v1.2.4）
@@ -242,27 +339,55 @@ v1.2.3 全部改掉并用只读 `probe` 验证：
 ## 七、构建与测试
 
 ```sh
-# 交叉编译（WSL + aarch64-linux-gnu-gcc）
-aarch64-linux-gnu-gcc -Os -s -static -Wno-format-truncation -Wno-unused-result \
-  -o module/bin/feather src/feather.c
+# 交叉编译（WSL + rustup + aarch64-linux-gnu-gcc 当链接器）
+bash tools/build_arm64.sh          # → module/bin/feather（静态 arm64，约 1.5MB）
 
-# 端到端测试：假 /sys /proc /cgroup 树 + 真实 arm64 二进制（binfmt/qemu-user）
-FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 54 项
+# 本机 x86 版本（给测试用；同一份源码）
+rustc --edition 2021 -O rust/main.rs -o /tmp/feather_rs
 
-# 打包
+# 端到端测试：假 /sys /proc /cgroup 树 + 真实二进制，84 项
+FEATHER_TEST_BIN=/tmp/feather_rs bash tests/run_tests_wsl.sh
+FEATHER_TEST_BIN=$PWD/module/bin/feather bash tests/run_tests_wsl.sh   # 需 qemu-user-static
+
+# arm64 产物冒烟（qemu-user，验证交叉编译不是「能链接但跑不起来」）
+bash tests/arm64_smoke.sh
+
+# 打包（会自动把文本文件归一化成 LF，并校验 module.prop / 权限位）
 python build.py
 ```
 
+> **打包必须走 `build.py`，不要手动 zip。** v1.4.0 的刷机失败就是 Windows 工作区把
+> `customize.sh` 存成了 CRLF，手动打包原样带进 zip，Android 的 `sh` 解析 `then\r` 直接报错。
+> 现在 `build.py` 会归一化、自检，并把 `bin/feather` 的权限位写成 `0755`。
+> 想手工核对：`unzip -p dist/FeatherTune_v1.4.7.zip customize.sh | grep -c $'\r'` 必须是 0。
+
 ```
-src/feather.c          单文件 C 守护进程（daemon + CLI + socket + HTTP + WebUI 托管）
+rust/main.rs           daemon 主循环 + CLI + 启动/单实例/信号
+rust/state.rs          全局状态（路径、配置、拓扑、充电节点、规则、缓存）
+rust/util.rs           sysfs IO / 日志 / 迷你正则（POSIX ERE 子集） / libc 绑定
+rust/cfg.rs            config.ini、apps.conf、labels.conf、games.conf、rules.conf
+rust/cpu.rs            拓扑识别、频率上限、uclamp、场景档位、hmbird、前台判定、线程归位
+rust/charge.rs         充电电流阶梯、充电加速（温度伪装）、功率采样
+rust/cmd.rs            state 落盘 + status/doctor/charge/power/probe/pkg/apps/icon…
+rust/net.rs            UNIX socket 控制口 + 127.0.0.1 HTTP 桥（poll 单线程）
+src/feather.c          v1.3.4 的 C 实现，保留作对照（tools/build_arm64_c.sh 可编）
 module/                Magisk/KSU/APatch 模块骨架（含 webroot/）
 module/bin/shell/      v1.0 的 shell 实现，仅作二进制跑不起来时的兜底
-tests/                 54 项端到端测试 + 假文件树 + 场景 CSV 分析脚本
+tests/                 108 项端到端测试 + 假文件树 + arm64 冒烟脚本
 docs/DESIGN.md         设计取舍、源码分析、每一轮实测复盘
+docs/FIXES_1.4.1.md    CRLF 刷机失败 / 图标链路 / charger v2 限流的根因与修复
+docs/FIXES_1.4.2.md    图标覆盖 / 双电芯功率 / 充电为何没有提升
+docs/SPEC_CHECK.md     对《SM8850 调度优化提示词》的逐条核对（WALT vs hmbird）
+docs/CHG_SPEC_CHECK.md 对《满血快充 Rust 守护进程提示词》的核对（v1/v2 充电栈差异）
+docs/CHG_EFFECT.md     为什么只有 67W / charge sweep 实测与适配器天花板
 ```
 
-> 交叉编译坑：`aarch64-linux-gnu-gcc -static` 加 `-Wl,--gc-sections` 会得到一个
-> **能启动、退出码 0、但 main 不执行** 的二进制（x86 正常）。所以不带 gc-sections。
+> 为什么 Rust 版比 C 版大（860KB → 1.5MB）：`std` 静态链进去就是这样。换来的是
+> 没有 `PATH_MAX`/`snprintf` 截断、没有漏 `close`、格式串与参数类型不符编译期就报错。
+> 仍保持单文件、零 fork、零外部依赖（正则自己实现，不引入任何 crate）。
+
+> 交叉编译坑（C 版踩过，Rust 版同理）：`-static` 加 `-Wl,--gc-sections` 会得到
+> **能启动、退出码 0、但 main 不执行** 的二进制。所以构建脚本不带 gc-sections。
 
 ---
 

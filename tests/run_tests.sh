@@ -30,7 +30,7 @@ export FEATHER_HMBIRD_SYS="$FAKE/proc/sys/hmbird_II"
 export FEATHER_SKIP_ROOT=1
 export FEATHER_WR_TRACE="$DATA/wr.trace"
 
-BIN="$PROJ/module/bin"
+BIN="$PROJ/module/bin/shell"      # 这套用例测的是 shell 兜底实现（C 版走 run_tests_wsl.sh）
 
 echo "== 1. 静态检查 =="
 for f in "$BIN"/*.sh "$PROJ/module"/*.sh "$HERE"/*.sh; do

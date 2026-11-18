@@ -1,6 +1,6 @@
 id=feather_tune
 name=羽量调校 · FeatherTune
-version=v1.2.9
-versionCode=10011
+version=v1.4.7
+versionCode=10024
 author=FeatherTune
-description=一加15 / SM8850 场景化功耗与调度调校。v1.2.1 修掉三个让游戏档从未生效的 bug（前台包名只读到第一个 pid、找到游戏主进程失败、基线被自己的限频污染），并按王者荣耀实测重排线程落核、游戏档抬高频率地板、帧率窗口对齐面板刷新率。C 守护进程常驻（静态 arm64，1Hz 零 fork），WebUI 走内核接口或本机 127.0.0.1:7891 双通道。支持 KernelSU / Magisk / APatch 与元模块。
+description=一加15 / SM8850 场景化功耗与调度调校。v1.4.7：亮屏/息屏峰值分开记录（一眼看出厂商亮屏限流）。v1.4.6：充电诊断升级——charge why 报适配器天花板/输入功率/电池温度余量；charge sweep 按 DT 分桶表逐档实测电流，用测量代替猜温度值。v1.4.5：守护进程自钉性能簇（daemon_pin=1，1Hz 轮询不唤醒超大核）。v1.4.4：应用名与图标改用管理器原生接口（ksu.getPackagesInfo 拿 appLabel、ksu://icon 拿系统渲染的 512px 图标，失败再回落 daemon 抠图）。v1.4.3：补 WALT 层（关 /proc/sys/walt 的触控加速并还原、doctor 报 walt/governor/capacity）。v1.4.2：图标覆盖更全（扫描 base/split 全部 APK，PNG/WebP/JPEG 尺寸嗅探，按方形≥48px + ic_launcher 本体打分，排除透明前景层与通知栏小图，换算法后自动清旧缓存）；双电芯功率修正（按 DT oplus,batt_num 判 2S，旧版靠 voltage_max 会把功率算成一半，config 的 battery_cells 可覆盖）；WebUI 新增「充电功率」一行（实时/峰值/电压×电芯/电流），ctl.sh charge why 直接说明「为什么功率没提升」。刷机包强制 LF，SukiSU/KernelSU/Magisk/APatch 与元模块通用。

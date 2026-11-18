@@ -11,7 +11,13 @@
 
 const MODID = 'feather_tune';
 const CTL   = `/data/adb/modules/${MODID}/bin/ctl.sh`;
-const HTTP_BASE = (location.protocol === 'http:') ? '' : 'http://127.0.0.1:7891';
+/* daemon 的本机端口。默认走 127.0.0.1:7891；
+ * 只有当「页面本身就是 daemon 托管的」时才改成同源 ''。
+ * 这一点以前只判断协议（http:）就置空，于是被 SukiSU/KernelSU 的 WebUI 服务器
+ * （同样是 http://127.0.0.1:<另一个端口>）打开时，图标请求发到了 WebUI 服务器上，
+ * 全部 404 —— 应用列表一切正常、只有图标全是首字母色块，就是这个原因。
+ * 现在由 probe() 实测同源 /version 后才决定 HTTP_BASE。 */
+let HTTP_BASE = 'http://127.0.0.1:7891';
 const DEMO  = new URLSearchParams(location.search).get('mock') === '1';
 
 /* 演示数据（?mock=1 或完全无通道时给页面一个可看的样子） */
@@ -66,15 +72,19 @@ async function execApi(cmd) {
 }
 
 /* ------------------------------------------------------------------ 通道 2 */
-async function httpGet(path, ms = 1600) {
+async function httpGetOn(base, path, ms = 1600) {
   try {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), ms);
-    const r = await fetch(HTTP_BASE + path, { signal: ac.signal, cache: 'no-store' });
+    const r = await fetch(base + path, { signal: ac.signal, cache: 'no-store' });
     clearTimeout(timer);
     if (!r.ok) return null;
     return await r.text();
   } catch (e) { return null; }
+}
+
+async function httpGet(path, ms = 1600) {
+  return httpGetOn(HTTP_BASE, path, ms);
 }
 
 function httpMap(cmd) {
@@ -121,10 +131,11 @@ let probePromise = null;
 function probe() {
   if (probePromise) return probePromise;   // 并发调用共享同一次探测
   probePromise = (async () => {
-    // 已经是 http 同源（页面由 daemon 提供），直接用它
+    // 页面本身由 daemon 托管（同源 /version 真的能通）才用同源，
+    // 否则一律显式打 127.0.0.1:7891 —— 被管理器的 WebUI 服务器托管时同源是错的。
     if (location.protocol === 'http:') {
-      const v = await httpGet('/version');
-      if (v && /v\d/.test(v)) { TRANSPORT = 'http'; return TRANSPORT; }
+      const v0 = await httpGetOn('', '/version');
+      if (v0 && /v\d/.test(v0)) { HTTP_BASE = ''; TRANSPORT = 'http'; return TRANSPORT; }
     }
     const e = await execApi('version');
     if (e && /v\d/.test(e)) { TRANSPORT = 'exec'; return TRANSPORT; }
@@ -265,21 +276,36 @@ function render() {
     auto_game: state.cfg_auto_game, thread_opt: state.cfg_thread_opt,
     screen_off_saver: state.cfg_screen_off, kill_boost: state.cfg_kill_boost,
     launch_boost: state.cfg_launch_boost, io_tune: state.cfg_io, gpu_tune: state.cfg_gpu,
-    charge_ctrl: state.cfg_charge_ctrl
+    charge_ctrl: state.cfg_charge_ctrl, accel_ctrl: state.cfg_accel_ctrl
   };
   $$('.switch input').forEach((el) => {
     const k = el.dataset.key;
     if (k in map && map[k] !== undefined) el.checked = map[k] === '1';
   });
 
-  // 充电状态：暂停 / 限流百分比 / 未接管
+  // 充电状态：加速中 / 暂停 / 限流百分比 / 未接管
   const chgEl = $('#chgState');
   if (chgEl) {
     const suspended = state.chg_suspend === '1';
     const pct = parseInt(state.chg_last_pct || '-1', 10);
     const soc = parseInt(state.battery || '0', 10);
     const temp = parseInt(state.temp || '0', 10);
-    if (state.cfg_charge_ctrl !== '1') {
+    const accelOn = state.cfg_accel_ctrl === '1';
+    const accelLive = state.accel === '1';
+    const accelVal = parseInt(state.accel_spoof || '0', 10);
+    const accelStop = parseInt(state.cfg_accel_stop || '45', 10);
+    if (accelLive) {
+      const same = state.accel_eff === '2';
+      chgEl.textContent = same ? '加速中·同段' : '加速中';
+      chgEl.classList.add('on');
+      $('#chgSub').textContent = same
+        ? `${soc}% · 真实 ${temp}℃ 与伪装 ${(accelVal / 10).toFixed(1)}℃ 同段，功率不会变（机身发烫时才生效）`
+        : `${soc}% · 真实 ${temp}℃ → 伪装 ${(accelVal / 10).toFixed(1)}℃`;
+    } else if (accelOn && state.accel_blocked === '1') {
+      chgEl.textContent = '已退出';
+      chgEl.classList.remove('on');
+      $('#chgSub').textContent = `${soc}% · ${temp}℃ 到 ${accelStop}℃ 线，已还原真实温度`;
+    } else if (state.cfg_charge_ctrl !== '1' && !accelOn) {
       chgEl.textContent = '已关闭';
       chgEl.classList.remove('on');
       $('#chgSub').textContent = '不干预厂商充电曲线';
@@ -295,6 +321,29 @@ function render() {
       chgEl.textContent = '全功率';
       chgEl.classList.remove('on');
       $('#chgSub').textContent = soc < 67 ? `${soc}% · 拐点前不干预` : `${soc}% · ${temp}℃`;
+    }
+    // 实测功率：双电芯必须 ×串联数，否则显示只有真实的一半
+    const watt = parseInt(state.chg_w || '0', 10);
+    const peak = parseInt(state.chg_peak || '0', 10);
+    const cells = Math.max(1, parseInt(state.cells || '1', 10) || 1);
+    const mv = parseInt(state.chg_mv || '0', 10);
+    const ma = Math.abs(parseInt(state.chg_ma || '0', 10));
+    const charging = (state.chg_status || '').includes('Charging');
+    const pwEl = $('#chgPower');
+    const pwSub = $('#chgPowerSub');
+    if (pwEl) {
+      pwEl.textContent = watt > 0 ? (watt / 10).toFixed(1) + 'W' : (charging ? '读取中' : '未充电');
+      pwEl.classList.toggle('on', watt > 0);
+      const parts = [];
+      if (mv > 0) parts.push(`${(mv / 1000).toFixed(2)}V×${cells}S`);
+      if (ma > 0) parts.push(`${(ma / 1000).toFixed(2)}A`);
+      if (peak > 0) parts.push(`峰值 ${(peak / 10).toFixed(1)}W`);
+      const peakOff = parseInt(state.chg_peak_off || '0', 10);
+      if (peakOff > 0) parts.push(`息屏峰值 ${(peakOff / 10).toFixed(1)}W`);
+      const kind = state.chg_node || '-';
+      if (kind === 'v2-current-now') parts.push('息屏限流节点');
+      else if (kind === 'none') parts.push('本机内核未开放限流节点');
+      if (pwSub) pwSub.textContent = parts.length ? parts.join(' · ') : '—';
     }
   }
 
@@ -444,14 +493,86 @@ async function readRules() {
 }
 
 /* ------------------------------------------------------------ 应用管理 ---- */
-let appListCache = [];        // [{pkg, mode, game}]
+let appListCache = [];        // [{pkg, mode, game, label}]
 let appFilterKey = 'all';
 let sheetPkg = null;
 const MODE_CN = { follow: '跟随场景', game: '游戏', battery: '省电', daily: '日常', perf: '满血', custom: '自定义' };
-// 图标统一走 daemon 的本机端口：KSU WebUI 里页面不是 daemon 提供的，
-// 但 127.0.0.1:7891 仍然可达（daemon 自己开了 CORS），这样 exec 通道也能显示图标
+
+/* --------------------------------------------------------------------------
+ * KSU / APatch 管理器自带的两个能力（kernel: manager WebViewInterface + WebViewHelper）：
+ *   ksu.listPackages('user')                → JSON 包名数组
+ *   ksu.getPackagesInfo(JSON.stringify([]))  → [{packageName, appLabel, isSystem, uid, ...}]
+ *   ksu://icon/<包名>                        → 管理器渲染好的 512px PNG（自适应图标也对）
+ * 新 API 在 ksu.pm() 上（KernelSU 2.x），旧 API 直接在 ksu 上；两个都试。
+ *
+ * 这比自己从 APK 里抠图靠谱得多：名字是系统的 appLabel，图标是系统渲染的成品。
+ * 只有管理器 WebView 里才有 window.ksu；用浏览器直连 127.0.0.1:7891（Magisk 等）
+ * 时没有它，仍然回落到 daemon 的抠图接口。
+ * ------------------------------------------------------------------------ */
+function ksuObj() {
+  try {
+    return (window.ksu && typeof window.ksu === 'object') ? window.ksu : null;
+  } catch (e) { return null; }
+}
+function ksuPm() {
+  try {
+    const k = ksuObj();
+    return (k && typeof k.pm === 'function') ? k.pm() : null;
+  } catch (e) { return null; }
+}
+function parseJsonish(v) {
+  if (v == null) return null;
+  if (typeof v === 'object') return v;
+  try { return JSON.parse(v); } catch (e) { return null; }
+}
+function nativeList(type) {
+  const pm = ksuPm();
+  if (pm && typeof pm.listPackages === 'function') {
+    const r = parseJsonish(pm.listPackages(type));
+    if (Array.isArray(r)) return r;
+  }
+  const k = ksuObj();
+  if (k && typeof k.listPackages === 'function') {
+    const r = parseJsonish(k.listPackages(type));
+    if (Array.isArray(r)) return r;
+  }
+  return null;
+}
+function nativeInfo(pkgs) {
+  if (!pkgs || !pkgs.length) return null;
+  const arg = JSON.stringify(pkgs);
+  const pm = ksuPm();
+  if (pm && typeof pm.getPackagesInfo === 'function') {
+    const r = parseJsonish(pm.getPackagesInfo(arg));
+    if (Array.isArray(r)) return r;
+  }
+  const k = ksuObj();
+  if (k && typeof k.getPackagesInfo === 'function') {
+    const r = parseJsonish(k.getPackagesInfo(arg));
+    if (Array.isArray(r)) return r;
+  }
+  return null;
+}
+
+// 图标地址：管理器里优先用 ksu://icon（系统渲染，PNG），否则走 daemon 的抠图缓存。
+// v=3 是抠图算法版本：换算法时浏览器缓存也要失效。
+const ICON_VER = 3;
+function daemonIcon(pkg) {
+  return `${HTTP_BASE}/icon?p=${encodeURIComponent(pkg)}&v=${ICON_VER}`;
+}
 function iconSrc(pkg) {
-  return `${HTTP_BASE}/icon?p=${encodeURIComponent(pkg)}`;
+  return ksuObj() ? `ksu://icon/${pkg}` : daemonIcon(pkg);
+}
+// 一张图可能有两级来源：ksu://icon 失败 → daemon；再失败 → 首字母
+function bindIconFallback(box) {
+  box.querySelectorAll('img.ico').forEach((img) => {
+    img.addEventListener('error', () => {
+      const fb = img.getAttribute('data-fb');
+      if (fb) { img.removeAttribute('data-fb'); img.src = fb; return; }
+      img.style.display = 'none';
+      if (img.parentNode) img.parentNode.classList.add('ph');
+    });
+  });
 }
 
 let labelsMap = {};
@@ -480,14 +601,41 @@ async function loadApps() {
   if (TRANSPORT === 'demo') {
     appListCache = DEMO_APPS.slice();
   } else {
-    const r = await api('apps');
-    appListCache = (r || '').split('\n').map((x) => x.trim()).filter(Boolean).map((line) => {
+    // daemon 给出的应用列表带策略（mode/game）与 labels.conf 的名字；
+    // 管理器原生 API 给出权威的包名集合与系统 appLabel。两边合并。
+    const [r, npkgs] = await Promise.all([api('apps'), Promise.resolve(nativeList('user'))]);
+    const parsed = (r || '').split('\n').map((x) => x.trim()).filter(Boolean).map((line) => {
       const [pkg, mode, game, label] = line.split('|');
       return {
         pkg, mode: !mode || mode === '-' ? 'follow' : mode,
         game: game === '1', label: label || '',
       };
     });
+    const byPkg = new Map(parsed.map((a) => [a.pkg, a]));
+    const nativeMap = new Map();
+    if (npkgs && npkgs.length) {
+      const infos = nativeInfo(npkgs) || [];
+      infos.forEach((it) => {
+        if (it && it.packageName) nativeMap.set(it.packageName, it);
+      });
+      // 原生列表里 daemon 没扫到的（新装应用、没有启动图标的应用）也补进来，
+      // 否则它们在“应用管理”里根本没法单独指定策略。
+      npkgs.forEach((p) => {
+        if (p && !byPkg.has(p)) {
+          byPkg.set(p, { pkg: p, mode: 'follow', game: false, label: '' });
+        }
+      });
+    }
+    appListCache = Array.from(byPkg.values()).map((a) => {
+      const it = nativeMap.get(a.pkg);
+      return {
+        ...a,
+        // 名字优先级：系统 appLabel（ColorOS 上本身就是中文）> labels.conf > 包名末段。
+        // labels.conf 只在拿不到 appLabel（浏览器直连 / 老管理器）时兜底。
+        label: (it && it.appLabel) || a.label || '',
+      };
+    });
+    appListCache.sort((x, y) => (x.label || x.pkg).localeCompare(y.label || y.pkg, 'zh-Hans-CN'));
   }
   renderRules(await readRules());
   renderApps();
@@ -513,11 +661,14 @@ function renderApps() {
     const modeText = a.mode === 'follow' ? (a.game ? '游戏名单' : '跟随场景') : (MODE_CN[a.mode] || a.mode);
     const title = a.label || a.pkg.split('.').pop();
     const initial = (a.label || a.pkg.replace(/^com\.|^cn\.|^net\./, '')).charAt(0).toUpperCase();
+    const src = iconSrc(a.pkg);
+    // ksu://icon 拿不到（系统应用不在管理器列表里）时，再退到 daemon 抠图
+    const fb = src.startsWith('ksu://') ? ` data-fb="${daemonIcon(a.pkg)}"` : '';
     return `
     <button class="row btn-row" data-pkg="${a.pkg}">
-      <span class="ico-wrap"><img class="ico" loading="lazy" alt=""
-        src="${iconSrc(a.pkg)}"
-        onerror="var w=this.parentNode;this.style.display='none';w.classList.add('ph')"><i class="ph-l">${initial}</i></span>
+      <span class="ico-wrap"><img class="ico" loading="lazy" decoding="async"
+        width="38" height="38" alt=""
+        src="${src}"${fb}><i class="ph-l">${initial}</i></span>
       <div class="row-main">
         <span class="row-title">${title}</span>
         <span class="row-sub">${a.pkg} · ${modeText}</span>
@@ -526,6 +677,7 @@ function renderApps() {
     </button>`;
   }).join('');
 
+  bindIconFallback(box);
   box.querySelectorAll('[data-pkg]').forEach((btn) => {
     btn.addEventListener('click', () => openSheet(btn.dataset.pkg));
   });

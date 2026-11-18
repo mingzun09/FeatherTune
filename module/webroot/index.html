@@ -90,12 +90,20 @@
     <div class="section-title">充电</div>
     <div class="group card">
       <div class="row">
-        <div class="row-main"><span class="row-title">充电控制</span><span class="row-sub">67% 前满功率；到 50℃ 降一档 120W→90W</span></div>
+        <div class="row-main"><span class="row-title">充电加速</span><span class="row-sub">按 DT 温度分桶曲线伪装机身温度（常温已是最快段，主要对发烫场景有效）</span></div>
+        <label class="switch"><input type="checkbox" data-key="accel_ctrl"><i></i></label>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">充电控制</span><span class="row-sub">67% 前满功率，之后按温度降流；本机走 battery/current_now，仅息屏生效</span></div>
         <label class="switch"><input type="checkbox" data-key="charge_ctrl"><i></i></label>
       </div>
       <div class="row">
         <div class="row-main"><span class="row-title">当前充电策略</span><span class="row-sub" id="chgSub">—</span></div>
         <span class="val" id="chgState">—</span>
+      </div>
+      <div class="row">
+        <div class="row-main"><span class="row-title">充电功率</span><span class="row-sub" id="chgPowerSub">—</span></div>
+        <span class="val" id="chgPower">—</span>
       </div>
     </div>
 

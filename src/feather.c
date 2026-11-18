@@ -43,8 +43,8 @@
 #define PATH_MAX 4096
 #endif
 
-#define APP_VER   "v1.2.9"
-#define APP_VC    10011
+#define APP_VER   "v1.4.0"
+#define APP_VC    10017
 #define MAX_FREQ  64
 #define MAX_POL   4
 #define MAX_RULES 64
@@ -293,6 +293,8 @@ typedef struct {
     char mode[16];
     char hm_coeff[48], hm_high[48], hm_heavy[64];
     int  charge_ctrl, charge_knee_soc, charge_temp_wall, charge_resume_temp;
+    // 充电加速（仿 UFCS 模块原理：写 oplus_dbg_tbat 伪装电池温度，让厂商不降额）
+    int  accel_ctrl, accel_tbat, accel_stop_temp, accel_resume_temp, accel_gentle, accel_gauge;
     char game_mode[16];     // official / light / aggressive
     char chg_curve[128];
 } cfg_t;
@@ -454,6 +456,8 @@ static void cfg_defaults(void) {
     snprintf(C.game_mode, sizeof C.game_mode, "official");
     C.charge_ctrl = 1; C.charge_knee_soc = 67; C.charge_temp_wall = 50;
     C.charge_resume_temp = 45;
+    C.accel_ctrl = 1; C.accel_tbat = 0; C.accel_stop_temp = 45;
+    C.accel_resume_temp = 42; C.accel_gentle = 0; C.accel_gauge = 0;
     snprintf(C.chg_curve, sizeof C.chg_curve, "36:100,38:88,40:78,42:66,44:55,50:50");
 }
 
@@ -527,8 +531,21 @@ static bool cfg_load(void) {   // 返回 true 表示内容有更新
         else if (!strcmp(key, "charge_temp_wall")) C.charge_temp_wall = atoi_safe(val, 43);
         else if (!strcmp(key, "charge_resume_temp")) C.charge_resume_temp = atoi_safe(val, 40);
         else if (!strcmp(key, "charge_curve")) snprintf(C.chg_curve, sizeof C.chg_curve, "%s", val);
+        else if (!strcmp(key, "accel_ctrl")) C.accel_ctrl = atoi_safe(val, 1);
+        else if (!strcmp(key, "accel_tbat")) C.accel_tbat = atoi_safe(val, 0);
+        else if (!strcmp(key, "accel_stop_temp")) C.accel_stop_temp = atoi_safe(val, 45);
+        else if (!strcmp(key, "accel_resume_temp")) C.accel_resume_temp = atoi_safe(val, 42);
+        else if (!strcmp(key, "accel_gentle")) C.accel_gentle = atoi_safe(val, 0);
+        else if (!strcmp(key, "accel_gauge")) C.accel_gauge = atoi_safe(val, 0);
     }
     fclose(f);
+    /* v1.3.0 的老配置里 accel_tbat=360，落在 warm/表外那一段，写它等于反向优化。
+     * 这里把越界的手动值统一退回自动档（用 DT 分桶表算），不让老配置继续拖后腿。 */
+    if (C.accel_tbat > 340) {
+        logv("accel: accel_tbat=%d 落在 warm/表外（有效范围 150~340），已退回自动档",
+             C.accel_tbat);
+        C.accel_tbat = 0;
+    }
     g_log_level = C.log_level;
     return true;
 }
@@ -646,6 +663,9 @@ static void uclamp_restore(void) {
 static long battery_cap(void);
 static long battery_temp(void);
 static void battery_status(char *out, size_t n);
+static int  battery_cells(void);
+static long current_ma(long ma);
+static long power_w10(long uv, long ma);
 
 /* ------------------------------------------------------------ 充电控制 --
  * 方案 A：只做「少要一点电流」，不碰温度上报、不碰 DT。
@@ -863,6 +883,266 @@ static void charge_restore(void) {
     g_chg_active = 0;
     g_chg_last_pct = -1;
     g_chg_gear = 0;
+}
+
+/* ------------------------------------------------------------ 充电加速 --
+ * 原理来自对闭源「充电加速」模块（Rust 守护进程）的逆向：
+ *   OPPO 的 oplus_chg_v2 状态机按电池温度 tbatt_temp 决定是否降额，
+ *   而 /sys/module/oplus_chg_v2/parameters/oplus_dbg_tbat 是它的调试温度覆盖口。
+ *   写 360 = 让算法认为电池恒为 36.0℃，于是不会退出 UFCS/PPS/SVOOC 高功率档
+ *   —— 这就是那个模块「加速」的全部手段（它没有写任何电压/电流节点）。
+ *
+ * 和闭源版的区别（安全边界，全部为本次自行加的）：
+ *   1) 只在 status=Charging 时伪装；拔线/充满/暂停立刻写回原值；
+ *   2) 保护仍然读真实 battery/temp：到 accel_stop_temp（默认 45℃）就停止伪装，
+ *      交给上面的温度阶梯继续降档；回落到 accel_resume_temp（42℃）才重新接管；
+ *   3) accel_ctrl=0 / enable=0 / 守护退出 / 卸载 → 一律还原，绝不留假温度；
+ *   4) 伪装值可调（accel_tbat，0.1℃ 单位）；温和档只把伪装值抬到 40℃。
+ */
+typedef struct {
+    char path[PATH_MAX];
+    char orig[32];
+    int  valid;
+} accel_node_t;
+
+/* 三个可写的内核参数（都是 module_param, 权限 0644）：
+ *   oplus_dbg_tbat      v2 oplus_chg_comm.c  → 覆盖「机身温度」shell_temp
+ *   gauge_dbg_tbat      v1/v2 gauge          → 覆盖「电池温度」（连保护一起骗，默认不用）
+ *   sub_gauge_dbg_tbat  v1/v2 gauge          → 覆盖副电芯温度
+ * 优先用 shell（不动电池保护）；shell 不存在且 accel_gauge=1 时才退到 gauge。
+ */
+static accel_node_t g_accel_shell;
+static accel_node_t g_accel_batt;
+static accel_node_t g_accel_sub;
+static int g_accel_ready;
+static int g_accel_spoofing;    // 当前正写着伪装值
+static int g_accel_blocked;     // 真实温度到线，暂停伪装（粘滞到回落）
+static int g_accel_written;     // 上次写入的值，避免每拍重复写
+static int g_accel_dt_val;      // 从 DT 温度分桶表算出的目标值（0=没读到）
+
+static int accel_open_node(accel_node_t *n, const char *mod, const char *param) {
+    char p[PATH_MAX], v[40];
+    if (n->valid) return 0;
+    snprintf(p, sizeof p, "%s/module/%s/parameters/%s", P_SYS, mod, param);
+    if (access(p, W_OK) != 0) return -1;
+    if (rdline(p, v, sizeof v) != 0) return -1;
+    snprintf(n->path, sizeof n->path, "%s", p);
+    snprintf(n->orig, sizeof n->orig, "%s", v);
+    n->valid = 1;
+    return 0;
+}
+
+/* UFCS/PPS 电流来自「温度分桶曲线」(oplus_strategy_pps_ufcs_curve.c)：
+ *   puc_get_temp_region(): 取第一个 temp < range[i] 的 i，段号 = i-1 → 分段是 [range[i-1], range[i])
+ *   6 段依次是 little_cold / cool / little_cool / normal_low / normal_high / warm，
+ *   所以「最高电流」在 normal_high = [range[n-3], range[n-2])。
+ * 30℃（300）已经在不少机型的 warm 段里，36℃（360）更是必然在 warm → 写大值只会更慢。
+ * 这里直接读 DT 的分桶表，把伪装值定在 normal_high 段里。 */
+static int accel_dt_scan(const char *dir, int depth) {
+    char path[PATH_MAX];
+    struct stat st;
+
+    if (depth > 4) return 0;
+    snprintf(path, sizeof path, "%s/oplus,temp_range", dir);
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 6 * 4) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            unsigned char buf[64];
+            size_t n = fread(buf, 1, sizeof buf, f);
+            fclose(f);
+            int cnt = (int)(n / 4);
+            if (cnt >= 6) {
+                int b[16];
+                for (int i = 0; i < cnt && i < 16; i++)
+                    b[i] = ((int)buf[i * 4] << 24) | ((int)buf[i * 4 + 1] << 16) |
+                           ((int)buf[i * 4 + 2] << 8) | (int)buf[i * 4 + 3];
+                int v = b[cnt - 3] + 10;                 // normal_high 段起点 +1℃
+                if (v >= b[cnt - 2] - 5) v = b[cnt - 2] - 10;
+                if (v < 150) v = 150;
+                logv("accel: DT %s cnt=%d [%d..%d] → 目标 %d", path, cnt, b[0], b[cnt - 1], v);
+                return v;
+            }
+        }
+    }
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    int found = 0;
+    while (!found && (e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char sub[PATH_MAX];
+        snprintf(sub, sizeof sub, "%s/%s", dir, e->d_name);
+        struct stat st2;
+        if (stat(sub, &st2) != 0 || !S_ISDIR(st2.st_mode)) continue;
+        found = accel_dt_scan(sub, depth + 1);
+    }
+    closedir(d);
+    return found;
+}
+
+static void accel_init(void) {
+    char buf[PATH_MAX];
+    if (g_accel_ready) return;
+    g_accel_ready = 1;
+    memset(&g_accel_shell, 0, sizeof g_accel_shell);
+    memset(&g_accel_batt, 0, sizeof g_accel_batt);
+    memset(&g_accel_sub, 0, sizeof g_accel_sub);
+
+    static const char *mods[] = { "oplus_chg_v2", "oplus_chg" };
+    for (size_t i = 0; i < sizeof mods / sizeof mods[0]; i++) {
+        accel_open_node(&g_accel_shell, mods[i], "oplus_dbg_tbat");
+        accel_open_node(&g_accel_batt, mods[i], "gauge_dbg_tbat");
+        accel_open_node(&g_accel_sub, mods[i], "sub_gauge_dbg_tbat");
+    }
+    /* 模块名可能带后缀（oplus_chg_v2_xxx），扫 /sys/module 兜底 */
+    char mdir[PATH_MAX];
+    snprintf(mdir, sizeof mdir, "%s/module", P_SYS);
+    DIR *d = opendir(mdir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strstr(e->d_name, "oplus_chg") == NULL) continue;
+            accel_open_node(&g_accel_shell, e->d_name, "oplus_dbg_tbat");
+            accel_open_node(&g_accel_batt, e->d_name, "gauge_dbg_tbat");
+            accel_open_node(&g_accel_sub, e->d_name, "sub_gauge_dbg_tbat");
+        }
+        closedir(d);
+    }
+
+    snprintf(buf, sizeof buf, "%s/firmware/devicetree/base", P_SYS);
+    g_accel_dt_val = accel_dt_scan(buf, 0);
+    if (!g_accel_dt_val) {
+        snprintf(buf, sizeof buf, "%s/device-tree", P_PROC);
+        g_accel_dt_val = accel_dt_scan(buf, 0);
+    }
+
+    if (g_accel_shell.valid || g_accel_batt.valid || g_accel_sub.valid)
+        logv("accel: shell=%s(%s) batt=%s(%s) sub=%s(%s) dt=%d",
+             g_accel_shell.valid ? "Y" : "-", g_accel_shell.valid ? g_accel_shell.orig : "-",
+             g_accel_batt.valid ? "Y" : "-", g_accel_batt.valid ? g_accel_batt.orig : "-",
+             g_accel_sub.valid ? "Y" : "-", g_accel_sub.valid ? g_accel_sub.orig : "-",
+             g_accel_dt_val);
+    else
+        logv("accel: 没有 oplus_chg 的温度参数节点，充电加速停用（非 OPPO 机型正常）");
+}
+
+static int accel_target(void) {
+    int v = C.accel_tbat > 0 ? C.accel_tbat : (g_accel_dt_val > 0 ? g_accel_dt_val : 250);
+    if (C.accel_gentle) v += 20;     // 温和档：整体抬 2℃，尽量仍留在同一段
+    if (v < 150) v = 150;            // 再低就掉进 cool 段，电流照样被限
+    if (v > 340) v = 340;            // warm 段是 250~350，>350 直接掉出表 → 一律钳住
+    return v;
+}
+
+static int accel_put(accel_node_t *n, int v) {
+    char b[16], rb[40];
+    if (!n->valid) return 0;
+    snprintf(b, sizeof b, "%d", v);
+    if (wrp(n->path, b) != 0) return -1;
+    if (rdline(n->path, rb, sizeof rb) == 0 && atoi(rb) != v) return -1;   // 回读校验
+    return 1;
+}
+
+// 写回原值并清状态（why 只用于日志，重复调用无副作用）
+static void accel_off(const char *why) {
+    if (!g_accel_spoofing) return;
+    if (g_accel_shell.valid) wrp(g_accel_shell.path, g_accel_shell.orig);
+    if (g_accel_batt.valid) wrp(g_accel_batt.path, g_accel_batt.orig);
+    if (g_accel_sub.valid) wrp(g_accel_sub.path, g_accel_sub.orig);
+    g_accel_spoofing = 0;
+    g_accel_written = 0;
+    logmsg("accel: 退出温度伪装（%s），已还原原值", why);
+}
+
+static void accel_restore(void) {
+    if (g_accel_spoofing) accel_off("退出");
+    g_accel_blocked = 0;
+}
+
+/* ---------------------------------------------------- 充电功率采样（诊断用）--
+ * 目的：测「加速到底有没有效果」必须插原装充电头，但那时 adb 被占用。
+ * 所以把电压/电流/峰值写进 state，WebUI 用手机浏览器就能看；每 30 拍再往日志里打一行，
+ * 拔线时打一条「本次充电峰值」，方便事后复盘。
+ * 符号约定：OPPO 的 battery/current_now 负值 = 充电，正值 = 放电。
+ */
+static long g_chg_peak_w10;      // 本次充电峰值（0.1W）
+static long g_chg_last_log;      // 上次打日志的 tick
+
+static void chg_read_power(long *mv, long *ma) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/class/power_supply/battery/voltage_now", P_SYS);
+    *mv = rdnum(p);
+    snprintf(p, sizeof p, "%s/class/power_supply/battery/current_now", P_SYS);
+    *ma = rdnum(p);
+}
+
+static void chg_power_tick(long tick) {
+    char st[32] = "";
+    battery_status(st, sizeof st);
+    int charging = strstr(st, "Charging") != NULL;
+    long mv = -1, ma = 0;
+    chg_read_power(&mv, &ma);
+
+    if (!charging) {
+        if (g_chg_peak_w10 > 0) {
+            logmsg("charge: 本次充电峰值 %ld.%ldW（%ld%% %.0f℃）",
+                   g_chg_peak_w10 / 10, g_chg_peak_w10 % 10,
+                   battery_cap(), (double)battery_temp());
+            g_chg_peak_w10 = 0;
+        }
+        return;
+    }
+    if (mv <= 0) return;
+    long watt10 = power_w10(mv, ma);
+    if (ma < 0 && watt10 > g_chg_peak_w10) g_chg_peak_w10 = watt10;
+    if (tick - g_chg_last_log >= 30) {
+        g_chg_last_log = tick;
+        logmsg("charge: %ld%% %.0f℃ %ldmV %+ldmA → %ld.%ldW（峰值 %ld.%ldW，伪装 %s）",
+               battery_cap(), (double)battery_temp(), mv / 1000, ma,
+               watt10 / 10, watt10 % 10, g_chg_peak_w10 / 10, g_chg_peak_w10 % 10,
+               g_accel_spoofing ? "开" : "关");
+    }
+}
+
+// 每拍调一次；temp = 真实电池温度（℃），charging = status 含 Charging
+static void accel_tick(long temp, int charging) {
+    if (!C.enable || !C.accel_ctrl) { accel_off("已关闭"); return; }
+    accel_init();
+    int use_gauge = (!g_accel_shell.valid && C.accel_gauge && g_accel_batt.valid);
+    if (!g_accel_shell.valid && !use_gauge) return;
+    if (!charging) { accel_off("未充电"); return; }
+
+    // 真实温度到线：停伪装，让温度阶梯（读真实温度）自己去降档
+    if (temp >= C.accel_stop_temp) {
+        if (!g_accel_blocked) {
+            g_accel_blocked = 1;
+            logmsg("accel: 电池 %.0f℃ 到线 %d℃，停止伪装温度，交温度阶梯降档",
+                   (double)temp, C.accel_stop_temp);
+        }
+        accel_off("过热");
+        return;
+    }
+    if (g_accel_blocked) {
+        if (temp > C.accel_resume_temp) return;   // 没凉下来就保持退出，别来回抖
+        g_accel_blocked = 0;
+        logmsg("accel: 电池回落到 %.0f℃（≤%d℃），恢复温度伪装", (double)temp, C.accel_resume_temp);
+    }
+
+    int v = accel_target();
+    if (g_accel_spoofing && g_accel_written == v) return;
+    int ok = 0;
+    if (g_accel_shell.valid) {
+        ok = accel_put(&g_accel_shell, v) > 0;
+    } else if (use_gauge) {
+        ok = accel_put(&g_accel_batt, v) > 0;
+        if (g_accel_sub.valid) accel_put(&g_accel_sub, v);
+    }
+    if (ok) {
+        g_accel_spoofing = 1;
+        g_accel_written = v;
+        logmsg("accel: 伪装%s温度 %.1f℃（真实电池 %.0f℃），曲线切到 normal_high 段",
+               g_accel_shell.valid ? "机身" : "电池", v / 10.0, (double)temp);
+    }
 }
 
 // ------------------------------------------------------------------ hmbird --
@@ -1635,6 +1915,48 @@ static void battery_status(char *out, size_t n) {
     if (rdline(p, out, n) != 0) out[0] = 0;
 }
 
+/* ---- 功率换算：双电芯机型（PLK110 这类 100W 机） voltage_now 给的是单芯电压、
+ *      current_now 是串联回路电流，真实功率必须乘电芯串联数，否则差一半。
+ *      判定：voltage_max（充电终止电压）> 6V 就是 2S，> 9V 是 3S。          */
+static int g_cells;
+static int battery_cells(void) {
+    if (g_cells) return g_cells;
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/class/power_supply/battery/voltage_max", P_SYS);
+    long vmax = rdnum(p);
+    g_cells = 1;
+    if (vmax > 6000000) g_cells = 2;
+    if (vmax > 9000000) g_cells = 3;
+    return g_cells;
+}
+
+/* 有的机型 current_now 是 µA（qc 系），有的是 mA（OPPO gauge）：>20A 一律按 µA 归一 */
+static long current_ma(long ma) {
+    if (ma > 20000 || ma < -20000) return ma / 1000;
+    return ma;
+}
+
+/* 返回 0.1W。注意 mv 是单芯电压，双电芯要乘串联数才是电池组实际功率 */
+static long power_w10(long uv, long ma) {
+    long mv = uv / 1000;
+    long ima = current_ma(ma);
+    if (mv <= 0) return 0;
+    if (ima < 0) ima = -ima;
+    long mvp = mv * battery_cells();
+    return mvp * ima / 100000;
+}
+
+/* 日志时间戳：/data/adb 里的进程没有 TZ，localtime 会按 UTC 打，比手机时间差 8 小时 */
+static void init_tz(void) {
+    if (getenv("TZ")) return;
+    char tz[64] = "";
+    if (rdline("/data/property/persist.sys.timezone", tz, sizeof tz) == 0 && tz[0] &&
+        strchr(tz, '/')) {
+        setenv("TZ", tz, 1);
+        tzset();
+    }
+}
+
 // ------------------------------------------------------------------- rules --
 typedef struct { char pkg[128]; char pat[192]; char tgt[48]; regex_t re; int valid; const char *target; } rule_t;
 static rule_t g_rules[MAX_RULES];
@@ -1930,10 +2252,12 @@ static void apply_profile(const char *name) {
 
 static void uclamp_restore(void);
 static void charge_restore(void);
+static void accel_restore(void);
 
 static void restore_all(void) {
     uclamp_restore();
     charge_restore();
+    accel_restore();
     logv("restore_all: npol=%d extras=%d", npol, g_game_extras);
     for (int i = 0; i < npol; i++) {
         long v = (g_base_ok && g_base_max[i] > 0) ? g_base_max[i] : pol[i].max;
@@ -2017,6 +2341,17 @@ static void state_write(const char *cur, const char *fg, int game, long batt,
     fprintf(f, "hmbird_live=%d\n", hmbird_live());
     fprintf(f, "hmbird_tuned=%d\n", g_hb_tuned);
     fprintf(f, "threads=%d\n", g_threads_pinned);
+    fprintf(f, "accel=%d\n", g_accel_spoofing);
+    fprintf(f, "accel_spoof=%d\n", g_accel_written);
+    fprintf(f, "accel_blocked=%d\n", g_accel_blocked);
+    fprintf(f, "accel_node=%s\n", g_accel_shell.valid ? "oplus_dbg_tbat" :
+            (g_accel_batt.valid ? "gauge_dbg_tbat" : "-"));
+    {
+        long mv = -1, ma = 0;
+        chg_read_power(&mv, &ma);
+        long w10 = power_w10(mv, ma);
+        fprintf(f, "chg_mv=%ld\nchg_ma=%ld\nchg_w=%ld\nchg_peak=%ld\n", mv, ma, w10, g_chg_peak_w10);
+    }
     fprintf(f, "boost_killed=%d\n", g_boost_killed);
     fprintf(f, "intensity=%d\n", C.intensity);
     fprintf(f, "uptime=%ld\n", up);
@@ -2077,6 +2412,11 @@ static void cmd_status(char *out, size_t n) {
     APP("cfg_launch_boost=%d\n", C.launch_boost);
     APP("cfg_log_level=%d\n", C.log_level);
     APP("cfg_charge_ctrl=%d\n", C.charge_ctrl);
+    APP("cfg_accel_ctrl=%d\n", C.accel_ctrl);
+    APP("cfg_accel_tbat=%d\n", C.accel_tbat);
+    APP("cfg_accel_stop=%d\n", C.accel_stop_temp);
+    APP("cfg_accel_gentle=%d\n", C.accel_gentle);
+    APP("cfg_accel_gauge=%d\n", C.accel_gauge);
     APP("cfg_game_mode=%s\n", C.game_mode);
     APP("chg_last_pct=%d\n", g_chg_last_pct);
     APP("chg_suspend=%d\n", g_chg_suspended);
@@ -2130,6 +2470,24 @@ static void cmd_doctor(char *out, size_t n) {
     char st[32];
     battery_status(st, sizeof st);
     APP("battery=%ld%% %s temp=%ld\n", cap, st, tmp);
+    {
+        accel_init();
+        accel_node_t *an = g_accel_shell.valid ? &g_accel_shell :
+                           (g_accel_batt.valid ? &g_accel_batt : NULL);
+        char av[40] = "-";
+        if (an) rdline(an->path, av, sizeof av);
+        APP("accel ctrl=%d gauge=%d node=%s now=%s orig=%s target=%d dt=%d spoofing=%d blocked=%d\n",
+            C.accel_ctrl, C.accel_gauge,
+            g_accel_shell.valid ? "oplus_dbg_tbat" : (g_accel_batt.valid ? "gauge_dbg_tbat" : "MISSING"),
+            av, an ? an->orig : "-", accel_target(), g_accel_dt_val,
+            g_accel_spoofing, g_accel_blocked);
+        if (!g_accel_shell.valid && !g_accel_batt.valid)
+            APP("  note: 没有 oplus_chg 的温度参数节点（非 OPPO 机型），充电加速不生效\n");
+        else if (!g_accel_shell.valid)
+            APP("  note: 只有 gauge_dbg_tbat（会连电池保护一起骗），需要 accel_gauge=1 才启用\n");
+        else if (g_accel_dt_val == 0)
+            APP("  note: 没读到 DT oplus,temp_range，用默认 25.0℃；没效果就试 set accel_tbat 200\n");
+    }
     APP("boost_killed=%d\ntaskset=%s\n", g_boost_killed,
         access("/system/bin/taskset", X_OK) == 0 ? "/system/bin/taskset" : "none");
     APP("refresh=%dHz\n", g_refresh);
@@ -2477,6 +2835,7 @@ static void run_cmd(const char *line, char *out, size_t n) {
                 "/class/oplus_chg/battery/batt_limit",
                 "/class/oplus_chg/battery/mmi_charging_enable",
                 "/class/power_supply/battery/voltage_max",
+                "/module/oplus_chg_v2/parameters/oplus_dbg_tbat",
             };
             for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
                 char p2[PATH_MAX], v2[64];
@@ -2496,11 +2855,94 @@ static void run_cmd(const char *line, char *out, size_t n) {
         CAPP("soc=%ld temp=%ld knee=%d wall=%d resume=%d curve=%s\n",
              battery_cap(), battery_temp(), C.charge_knee_soc, C.charge_temp_wall,
              C.charge_resume_temp, C.chg_curve);
+        accel_init();
+        CAPP("accel: enabled=%d gauge=%d target=%d auto_dt=%d stop=%d gentle=%d\n",
+             C.accel_ctrl, C.accel_gauge, accel_target(), g_accel_dt_val,
+             C.accel_stop_temp, C.accel_gentle);
+        CAPP("accel_node shell=%s orig=%s | batt=%s orig=%s | sub=%s\n",
+             g_accel_shell.valid ? g_accel_shell.path : "-", g_accel_shell.valid ? g_accel_shell.orig : "-",
+             g_accel_batt.valid ? g_accel_batt.path : "-", g_accel_batt.valid ? g_accel_batt.orig : "-",
+             g_accel_sub.valid ? g_accel_sub.path : "-");
+        {
+            /* 运行时状态只能来自守护进程写的 state 文件：
+             * 这条命令是独立进程，自己的 g_accel_* 永远是 0。 */
+            int rt_s = -1, rt_v = -1, rt_b = -1, rt_mode = -1;
+            FILE *sf = fopen(P_STATE, "r");
+            if (sf) {
+                char line[256];
+                while (fgets(line, sizeof line, sf)) {
+                    if (!strncmp(line, "accel_spoof=", 12)) rt_v = atoi(line + 12);
+                    else if (!strncmp(line, "accel_blocked=", 14)) rt_b = atoi(line + 14);
+                    else if (!strncmp(line, "accel=", 6)) rt_s = atoi(line + 6);
+                    else if (!strncmp(line, "updated=", 8)) rt_mode = 1;
+                }
+                fclose(sf);
+            }
+            CAPP("accel_rt: spoofing=%d value=%d blocked=%d (state %s)\n",
+                 rt_s, rt_v, rt_b, rt_mode > 0 ? "ok" : "缺失/守护进程没跑");
+            char pth[PATH_MAX], st[32] = "?", vbuf[32] = "?", ibuf[32] = "?";
+            snprintf(pth, sizeof pth, "%s/class/power_supply/battery/status", P_SYS);
+            rdline(pth, st, sizeof st);
+            snprintf(pth, sizeof pth, "%s/class/power_supply/battery/voltage_now", P_SYS);
+            rdline(pth, vbuf, sizeof vbuf);
+            snprintf(pth, sizeof pth, "%s/class/power_supply/battery/current_now", P_SYS);
+            rdline(pth, ibuf, sizeof ibuf);
+            long uv = strtol(vbuf, NULL, 10), ua = strtol(ibuf, NULL, 10);
+            long w10 = power_w10(uv, ua);
+            CAPP("power: status=%s %dS vbat=%ldmV ibat=%+ldmA → %ld.%ldW（%s）\n",
+                 st, battery_cells(), uv / 1000, current_ma(ua), w10 / 10, w10 % 10,
+                 ua < 0 ? "充入电池" : "放电/入不敷出，PC USB 口常见，测加速请用原装充电头");
+        }
 #undef CAPP
         return;
     }
     if (!strcmp(cmd, "version")) { snprintf(out, n, "%s (%d)\n", APP_VER, APP_VC); return; }
     // 只读探测：只报告路径与可写性，不写任何系统节点、不落状态
+    if (!strcmp(cmd, "power")) {
+        // power -> 把 power_supply 下每个设备的电量/电压/电流/协议属性全打出来，
+        //          用来判断充电协议（UFCS/SVOOC/PD）到底协商到哪一档
+        size_t off = 0;
+#define WAPP(...) do { if (off < n) off += (size_t)snprintf(out + off, n - off, __VA_ARGS__); } while (0)
+        char st[32] = "";
+        battery_status(st, sizeof st);
+        long mv = -1, ma = 0;
+        chg_read_power(&mv, &ma);
+        long w10 = power_w10(mv, ma);
+        WAPP("soc=%ld temp=%ld status=%s cells=%d\n", battery_cap(), battery_temp(), st, battery_cells());
+        WAPP("battery: vbat=%ldmV ibat=%+ldmA → %ld.%ldW\n", mv / 1000, current_ma(ma), w10 / 10, w10 % 10);
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof dir, "%s/class/power_supply", P_SYS);
+        DIR *d = opendir(dir);
+        if (!d) { WAPP("err=no_power_supply\n"); return; }
+        static const char *attrs[] = {
+            "online", "status", "type", "real_type", "voltage_now", "voltage_max",
+            "current_now", "current_max", "input_current_limit", "charge_type",
+            "constant_charge_current_max", "capacity", "temp", "cycle_count",
+        };
+        struct dirent *e;
+        int cnt = 0;
+        while ((e = readdir(d)) != NULL && cnt < 12) {
+            if (e->d_name[0] == '.') continue;
+            char pd[PATH_MAX];
+            struct stat sb;
+            snprintf(pd, sizeof pd, "%s/%s", dir, e->d_name);
+            if (stat(pd, &sb) != 0 || !S_ISDIR(sb.st_mode)) continue;
+            cnt++;
+            char line[768];
+            size_t lo = 0;
+            for (size_t i = 0; i < sizeof attrs / sizeof attrs[0] && lo < sizeof line - 64; i++) {
+                char ap[PATH_MAX], v[48];
+                snprintf(ap, sizeof ap, "%s/%s", pd, attrs[i]);
+                if (rdline(ap, v, sizeof v) == 0)
+                    lo += (size_t)snprintf(line + lo, sizeof line - lo, "%s=%s ", attrs[i], v);
+            }
+            if (lo) WAPP("%s: %s\n", e->d_name, line);
+        }
+        closedir(d);
+#undef WAPP
+        return;
+    }
+
     if (!strcmp(cmd, "probe")) {
         size_t off = 0;
 #define PAPP(...) do { if (off < n) off += (size_t)snprintf(out + off, n - off, __VA_ARGS__); } while (0)
@@ -3008,6 +3450,13 @@ static int run_daemon(void) {
         }
 
         charge_tick();
+        {
+            // 充电加速：用真实温度做我们自己那道闸，伪装只影响厂商侧
+            char cst[32] = "";
+            battery_status(cst, sizeof cst);
+            accel_tick(battery_temp(), strstr(cst, "Charging") != NULL);
+        }
+        chg_power_tick(tick);
 
         if (!strcmp(cur, "game") && C.thread_opt && !strcmp(C.game_mode, "aggressive")) {
             long pid = find_game_pid(last_fg);
@@ -3143,6 +3592,7 @@ int main(int argc, char **argv) {
     prctl(PR_SET_NAME, "featherd-daemon", 0, 0, 0);
     path_init();
     read_buildprops();
+    init_tz();          // 日志时间戳跟手机一致（/data/adb 下默认是 UTC）
     static char outbuf[65536];
     return cli_main(argc, argv, outbuf, sizeof outbuf);
 }
