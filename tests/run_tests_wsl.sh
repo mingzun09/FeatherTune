@@ -198,7 +198,9 @@ PS="$FAKE/sys/class/power_supply/battery"
 # 1) 拐点以下：完全不干预，必须跑满
 echo 50 > "$PS/capacity"; echo 360 > "$PS/temp"; echo Charging > "$PS/status"
 sleep 3
+wait_state "charging=1" 10
 check "SOC 50% 36℃ → 满电流不干预" 'grep -qx 6000000 "$PS/constant_charge_current_max"' "cur=$(cat "$PS/constant_charge_current_max")"
+check "state 标记 charging=1"      'grep -qx "charging=1" "$DATA/state"' "$(grep '^charging=' "$DATA/state")"
 
 # 2) 到 50℃ 温度墙：降一档（75% ≈ 90W），不是暂停
 echo 500 > "$PS/temp"
@@ -233,7 +235,9 @@ check "SOC 70% 39℃ → 曲线 88%"  '[ "$CUR" -ge 5200000 ] && [ "$CUR" -le 53
 # 7) 停止充电：还原
 echo Discharging > "$PS/status"
 sleep 2
+wait_state "charging=0" 10
 check "停止充电 → 还原原始电流" 'grep -qx 6000000 "$PS/constant_charge_current_max"' "cur=$(cat "$PS/constant_charge_current_max")"
+check "state 标记 charging=0"      'grep -qx "charging=0" "$DATA/state"' "$(grep '^charging=' "$DATA/state")"
 
 echo "== 5.55 充电加速（写 oplus_dbg_tbat / DT 分桶表自动定值，v1.3.1）=="
 AT="$FAKE/sys/module/oplus_chg_v2/parameters/oplus_dbg_tbat"

@@ -10,7 +10,7 @@
 - ROOT：KernelSU / SukiSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.4.8 · versionCode 10025 · Rust 静态守护进程（1.5 MB，零依赖、零 fork）
+> v1.4.9 · versionCode 10026 · Rust 静态守护进程（1.5 MB，零依赖、零 fork）
 
 ![首页](shots/1home-light.png)
 
@@ -274,7 +274,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.4.8.zip`，在 KernelSU / SukiSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.4.9.zip`，在 KernelSU / SukiSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -360,7 +360,7 @@ python build.py
 > **打包必须走 `build.py`，不要手动 zip。** v1.4.0 的刷机失败就是 Windows 工作区把
 > `customize.sh` 存成了 CRLF，手动打包原样带进 zip，Android 的 `sh` 解析 `then\r` 直接报错。
 > 现在 `build.py` 会归一化、自检，并把 `bin/feather` 的权限位写成 `0755`。
-> 想手工核对：`unzip -p dist/FeatherTune_v1.4.8.zip customize.sh | grep -c $'\r'` 必须是 0。
+> 想手工核对：`unzip -p dist/FeatherTune_v1.4.9.zip customize.sh | grep -c $'\r'` 必须是 0。
 
 ```
 rust/main.rs           daemon 主循环 + CLI + 启动/单实例/信号
@@ -374,7 +374,7 @@ rust/net.rs            UNIX socket 控制口 + 127.0.0.1 HTTP 桥（poll 单线�
 src/feather.c          v1.3.4 的 C 实现，保留作对照（tools/build_arm64_c.sh 可编）
 module/                Magisk/KSU/APatch 模块骨架（含 webroot/）
 module/bin/shell/      v1.0 的 shell 实现，仅作二进制跑不起来时的兜底
-tests/                 112 项端到端测试 + 假文件树 + arm64 冒烟脚本
+tests/                 114 项端到端测试 + 假文件树 + arm64 冒烟脚本
 docs/DESIGN.md         设计取舍、源码分析、每一轮实测复盘
 docs/FIXES_1.4.1.md    CRLF 刷机失败 / 图标链路 / charger v2 限流的根因与修复
 docs/FIXES_1.4.2.md    图标覆盖 / 双电芯功率 / 充电为何没有提升

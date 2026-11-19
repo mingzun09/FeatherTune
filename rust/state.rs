@@ -11,8 +11,8 @@
 #![allow(static_mut_refs)]
 
 // ------------------------------------------------------------------ 常量 ----
-pub const APP_VER: &str = "v1.4.8";
-pub const APP_VC: i32 = 10025;
+pub const APP_VER: &str = "v1.4.9";
+pub const APP_VC: i32 = 10026;
 pub const MAX_FREQ: usize = 64;
 pub const MAX_POL: usize = 4;
 pub const MAX_RULES: usize = 64;

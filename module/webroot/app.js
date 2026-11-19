@@ -326,28 +326,43 @@ function render() {
       chgEl.classList.remove('on');
       $('#chgSub').textContent = soc < 67 ? `${soc}% · 拐点前不干预` : `${soc}% · ${temp}℃`;
     }
-    // 实测功率：双电芯必须 ×串联数，否则显示只有真实的一半
+    // 实测功率：双电芯必须 ×串联数，否则显示只有真实的一半。
+    // 必须按充电状态分支——放电时 current_now 也是非零，直接算会把放电功率当成充电功率。
     const watt = parseInt(state.chg_w || '0', 10);
     const peak = parseInt(state.chg_peak || '0', 10);
     const cells = Math.max(1, parseInt(state.cells || '1', 10) || 1);
     const mv = parseInt(state.chg_mv || '0', 10);
     const ma = Math.abs(parseInt(state.chg_ma || '0', 10));
-    const charging = (state.chg_status || '').includes('Charging');
+    const stStr = (state.chg_status || '').trim();
+    // 优先用 daemon 写的 charging 布尔；老版本 state 没有这个键时退回状态字符串
+    const charging = state.charging === undefined
+      ? /^Charging$/i.test(stStr)
+      : state.charging === '1';
+    const full = /^Full$/i.test(stStr);
     const pwEl = $('#chgPower');
     const pwSub = $('#chgPowerSub');
     if (pwEl) {
-      pwEl.textContent = watt > 0 ? (watt / 10).toFixed(1) + 'W' : (charging ? '读取中' : '未充电');
-      pwEl.classList.toggle('on', watt > 0);
-      const parts = [];
-      if (mv > 0) parts.push(`${(mv / 1000).toFixed(2)}V×${cells}S`);
-      if (ma > 0) parts.push(`${(ma / 1000).toFixed(2)}A`);
-      if (peak > 0) parts.push(`峰值 ${(peak / 10).toFixed(1)}W`);
-      const peakOff = parseInt(state.chg_peak_off || '0', 10);
-      if (peakOff > 0) parts.push(`息屏峰值 ${(peakOff / 10).toFixed(1)}W`);
-      const kind = state.chg_node || '-';
-      if (kind === 'v2-current-now') parts.push('息屏限流节点');
-      else if (kind === 'none') parts.push('本机内核未开放限流节点');
-      if (pwSub) pwSub.textContent = parts.length ? parts.join(' · ') : '—';
+      if (!charging) {
+        pwEl.textContent = full ? '已充满' : '未充电';
+        pwEl.classList.remove('on');
+        const off = [];
+        if (mv > 0) off.push(`${(mv / 1000).toFixed(2)}V×${cells}S`);
+        if (ma > 0) off.push(`放电 ${(ma / 1000).toFixed(2)}A`);
+        if (pwSub) pwSub.textContent = off.length ? off.join(' · ') : '—';
+      } else {
+        pwEl.textContent = watt > 0 ? (watt / 10).toFixed(1) + 'W' : '读取中';
+        pwEl.classList.toggle('on', watt > 0);
+        const parts = [];
+        if (mv > 0) parts.push(`${(mv / 1000).toFixed(2)}V×${cells}S`);
+        if (ma > 0) parts.push(`${(ma / 1000).toFixed(2)}A`);
+        if (peak > 0) parts.push(`峰值 ${(peak / 10).toFixed(1)}W`);
+        const peakOff = parseInt(state.chg_peak_off || '0', 10);
+        if (peakOff > 0) parts.push(`息屏峰值 ${(peakOff / 10).toFixed(1)}W`);
+        const kind = state.chg_node || '-';
+        if (kind === 'v2-current-now') parts.push('息屏限流节点');
+        else if (kind === 'none') parts.push('本机内核未开放限流节点');
+        if (pwSub) pwSub.textContent = parts.length ? parts.join(' · ') : '—';
+      }
     }
   }
 

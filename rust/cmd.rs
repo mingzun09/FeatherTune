@@ -69,6 +69,9 @@ pub fn state_write(cur: &str, fg: &str, game: bool, batt: i64, temp: i64, screen
     s.push_str(&format!("accel_node={}\n", anode));
     let (mv, ma) = chg_read_power();
     let w10 = power_w10(mv, ma);
+    // 充电状态只读一次：WebUI 用它决定显示「功率」还是「未充电/已充满」
+    let chg_stt = battery_status();
+    let charging = chg_stt.contains("Charging");
     s.push_str(&format!(
         "chg_mv={}\nchg_ma={}\nchg_w={}\nchg_peak={}\nchg_peak_on={}\nchg_peak_off={}\n",
         mv,
@@ -80,9 +83,10 @@ pub fn state_write(cur: &str, fg: &str, game: bool, batt: i64, temp: i64, screen
     ));
     // 电芯数与充电节点类型：WebUI 需要它们才能把功率换算对、并解释“为什么限流没生效”
     s.push_str(&format!(
-        "cells={}\nchg_status={}\nchg_gear={}\nchg_node={}\n",
+        "charging={}\ncells={}\nchg_status={}\nchg_gear={}\nchg_node={}\n",
+        if charging { 1 } else { 0 },
         battery_cells(),
-        battery_status(),
+        chg_stt,
         st().chg_gear,
         if st().chg_cur.valid {
             chg_kind_name(st().chg_cur.kind)
