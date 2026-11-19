@@ -141,6 +141,8 @@ com.netease.cloudmusic  custom 70 60 20 0
 
 ### 充电功率显示与诊断（v1.4.2）
 
+![充电界面（深色）](shots/ui_charge_dark.png)
+
 WebUI 的「充电功率」一行同时给出**实时功率 / 峰值 / 电压×电芯 / 电流**。双电芯机型必须乘串联数：
 
 - 判定顺序：`config.ini` 的 `battery_cells`（0=自动）→ DT `oplus,batt_num`（一加 15 = 2）→
@@ -175,6 +177,8 @@ su -c 'sh /data/adb/modules/feather_tune/bin/ctl.sh charge probe'   # 看这台�
 ```
 
 ### 充电加速（v1.3.1，按内核源码修正）
+
+![充电加速开启时的概览页](shots/ui_accel_on.png)
 
 翻 `vendor/oplus/kernel/charger/v2/` 后的结论：UFCS/PPS 的电流**不是**由“降额等级”给的，而是由
 「温度分桶曲线」给的（`strategy/oplus_strategy_pps_ufcs_curve.c`）：
