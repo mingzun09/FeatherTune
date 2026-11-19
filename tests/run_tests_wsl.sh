@@ -114,9 +114,16 @@ check "线程计数 > 0"              'echo "$S" | grep -qE "^threads=[1-9]"' "$
 # WALT 才是本机真正的触控加速入口（/proc/sys/walt/*），通用 cpu_boost 节点在真机上大多不存在
 check "WALT input_boost_ms 已关"   'grep -qx 0 "$FAKE/proc/sys/walt/input_boost_ms"' "now=$(cat "$FAKE/proc/sys/walt/input_boost_ms" 2>/dev/null)"
 check "WALT sched_boost_on_input 已关" 'grep -qx 0 "$FAKE/proc/sys/walt/sched_boost_on_input"' ""
+check "OPLUS touch_boost_ms 已关"   'grep -qx 0 "$FAKE/sys/devices/platform/soc/oplus-touch-boost/touch_boost/touch_boost_ms"' "now=$(cat "$FAKE/sys/devices/platform/soc/oplus-touch-boost/touch_boost/touch_boost_ms" 2>/dev/null)"
+BOUT=$("$BIN" boost 2>&1)
+check "boost 诊断列出 WALT 节点"    'echo "$BOUT" | grep -q "walt_boost_nodes=.*input_boost_ms"' "$(echo "$BOUT" | grep walt_boost_nodes=)"
+check "boost 诊断列出 touch_boost"  'echo "$BOUT" | grep -q "oplus-touch-boost/touch_boost/touch_boost_ms"' "$(echo "$BOUT" | grep -c touch_boost)"
 check "守护进程已把自己钉到性能簇"  'grep -q "自身亲和性钉到 0x3f" "$DATA/feather.log"' "$(grep '自身亲和性' "$DATA/feather.log" 2>/dev/null | tail -1)"
 out=$("$BIN" doctor 2>&1)
 check "doctor 报 WALT 与 governor"  'echo "$out" | grep -q "^walt=yes" && echo "$out" | grep -q "^governor: policy0="' "$(echo "$out" | grep -E '^(walt|governor)')"
+# 注意：测试树挂在 /mnt/d（drvfs 不支持 AF_UNIX socket），守护进程的 socket 绑不上，
+# CLI 一律本地计算；boost 的运行时计数只能从 daemon 写的 state 文件里读。
+check "state 回填 boost_probed/boost_mode" 'grep -qx "boost_probed=4" "$DATA/state" && grep -qx "boost_mode=1" "$DATA/state"' "$(grep -E '^boost_(probed|mode)=' "$DATA/state" 2>/dev/null | tr '\n' ' ')"
 check "doctor 报 daemon_pin/perf_mask" 'echo "$out" | grep -q "^daemon_pin=1 perf_mask=0x3f"' "$(echo "$out" | grep '^daemon_pin')"
 
 echo "== 2.5 规则加载 =="

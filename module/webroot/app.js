@@ -264,7 +264,11 @@ function render() {
   $('#stHm').textContent = hm ? (state.hmbird_live === '1' ? '已接管' : '已就绪') : '未检测到';
   $('#stHm').classList.toggle('on', hm);
   const bk = parseInt(state.boost_killed || '0', 10);
-  $('#stBoost').textContent = bk > 0 ? bk + ' 项' : '无节点';
+  const bp = parseInt(state.boost_probed || '0', 10);
+  const bm = parseInt(state.boost_mode || '0', 10);
+  const bsrc = bm === 1 ? 'WALT' : bm === 2 ? 'oplus_touch' : bm === 3 ? 'legacy' : '';
+  $('#stBoost').textContent = bk > 0 ? bk + ' 项' : (bp > 0 ? '节点不可写' : '无节点');
+  if (bk > 0) $('#stBoost').title = `来源 ${bsrc}，候选存在 ${bp} 个`;
   $('#stBoost').classList.toggle('on', bk > 0);
   const tc = $('#stTransport');
   if (tc) {

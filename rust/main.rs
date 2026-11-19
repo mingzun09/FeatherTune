@@ -449,7 +449,7 @@ fn do_reset() {
 fn cli_main() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {
-        println!("usage: feather <run|start|stop|restart|status|set|mode|doctor|pkg|apps|log|restore|reset|version>");
+        println!("usage: feather <run|start|stop|restart|status|set|mode|doctor|pkg|apps|log|restore|reset|charge|boost|version>");
         return 2;
     }
     let c = argv[1].as_str();

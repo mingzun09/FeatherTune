@@ -90,7 +90,12 @@ pub fn state_write(cur: &str, fg: &str, game: bool, batt: i64, temp: i64, screen
             "none"
         }
     ));
-    s.push_str(&format!("boost_killed={}\n", st().boost_killed));    s.push_str(&format!("intensity={}\n", st().c.intensity));
+    s.push_str(&format!("boost_killed={}\n", st().boost_killed));
+    s.push_str(&format!(
+        "boost_probed={}\nboost_mode={}\n",
+        st().boost_probed,
+        st().boost_mode
+    ));    s.push_str(&format!("intensity={}\n", st().c.intensity));
     // WebUI 的开关/分段控件全靠这些 cfg_* 回填；缺了它们，页面上的开关永远是关的、
     // 充电策略永远显示“已关闭”——之前“改了没反应”有一半是这个原因。
     s.push_str(&format!(
@@ -734,6 +739,7 @@ pub fn run_cmd(line: &str) -> String {
             return out;
         }
         "charge" => return cmd_charge(args.get(1).copied().unwrap_or(""), args.get(2).copied()),
+        "boost" => return cmd_boost(),
         "version" => return format!("{} ({})\n", crate::state::APP_VER, crate::state::APP_VC),
         "power" => return cmd_power(),
         "probe" => return cmd_probe(),
@@ -1093,6 +1099,57 @@ fn charge_why() -> String {
         }
     } else {
         out.push_str("verdict: 没读到 DT oplus,temp_range，加速档位未知（可用 accel_tbat 手动指定）\n");
+    }
+    out
+}
+
+fn cmd_boost() -> String {
+    let mut out = String::new();
+    let walt = format!("{}/sys/walt", st().p.proc_);
+    out.push_str(&format!(
+        "walt_dir={} exists={}\n",
+        walt,
+        if exists(&walt) { 1 } else { 0 }
+    ));
+    if let Ok(rd) = fs::read_dir(&walt) {
+        let mut names: Vec<String> = rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("boost"))
+            .collect();
+        names.sort();
+        out.push_str(&format!("walt_boost_nodes={}\n", names.join(",")));
+    }
+    let targets = boost_targets();
+    out.push_str(&format!(
+        "candidates={} mode_now={} probed={} killed={}\n",
+        targets.len(),
+        st().boost_mode,
+        st().boost_probed,
+        st().boost_killed
+    ));
+    // 只读探测其它厂商 boost 入口（frame_boost 不关：关掉会破坏 165Hz 帧同步）
+    for d in [
+        "/proc/oplus_frame_boost",
+        "/sys/kernel/oplus_boost",
+        "/sys/module/cpu_boost",
+        "/sys/module/msm_performance",
+    ] {
+        out.push_str(&format!("probe {} exists={}\n", d, if exists(d) { 1 } else { 0 }));
+    }
+    if let Some(v) = rdline("/proc/oplus_frame_boost/sys_ctrl") {
+        out.push_str(&format!("frame_boost sys_ctrl={}\n", v));
+    }
+    for p in targets {
+        if !exists(&p) {
+            continue;
+        }
+        out.push_str(&format!(
+            "{}\n  val={} writable={}\n",
+            p,
+            rdline(&p).unwrap_or_else(|| "-".to_string()),
+            if writable(&p) { 1 } else { 0 }
+        ));
     }
     out
 }
@@ -1729,6 +1786,20 @@ fn cmd_doctor() -> String {
             "none"
         }
     ));
+    out.push_str(&format!(
+        "boost: mode={} (1=WALT 2=oplus_touch 3=legacy) probed={} killed={}\n",
+        st().boost_mode, st().boost_probed, st().boost_killed
+    ));
+    for p in boost_targets() {
+        if exists(&p) {
+            out.push_str(&format!(
+                "  boost node {} = {} ({})\n",
+                p,
+                rdline(&p).unwrap_or_else(|| "?".to_string()),
+                if writable(&p) { "writable" } else { "readonly" }
+            ));
+        }
+    }
     out.push_str(&format!("refresh={}Hz\n", st().refresh));
     if ip >= 0 {
         let mp = format!("{}/scaling_min_freq", st().pol[ip as usize].path);

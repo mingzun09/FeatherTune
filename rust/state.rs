@@ -11,8 +11,8 @@
 #![allow(static_mut_refs)]
 
 // ------------------------------------------------------------------ 常量 ----
-pub const APP_VER: &str = "v1.4.7";
-pub const APP_VC: i32 = 10024;
+pub const APP_VER: &str = "v1.4.8";
+pub const APP_VC: i32 = 10025;
 pub const MAX_FREQ: usize = 64;
 pub const MAX_POL: usize = 4;
 pub const MAX_RULES: usize = 64;
@@ -307,6 +307,10 @@ pub struct State {
     pub pin_kind: i32,
 
     pub boost_killed: i32,
+    /// boost 候选里实际存在的节点数（区分「没有节点」和「有节点但写不进」）
+    pub boost_probed: i32,
+    /// 1=WALT 2=oplus touch_boost 3=legacy；0=一个都没找到
+    pub boost_mode: i32,
     /// 被 boost_off() 改过的节点原值（退出时逐个还原，而不是统一写 1/0）
     pub boost_save: Vec<HmSave>,
 
@@ -403,6 +407,8 @@ impl State {
             pm_errno: 0,
             pin_kind: 0,
             boost_killed: 0,
+            boost_probed: 0,
+            boost_mode: 0,
             boost_save: Vec::new(),
             seen: Vec::new(),
             seen_pid: -1,

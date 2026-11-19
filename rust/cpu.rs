@@ -642,16 +642,83 @@ const BOOST_NODES: [&str; 8] = [
 /// `input_boost_freq` 是 8 个 u32 的数组，写 "0" 语义不明确，不动它。
 const WALT_BOOST_NODES: [&str; 3] = ["input_boost_ms", "sched_boost_on_input", "sched_boost"];
 
-pub fn boost_off() {
-    let walt = format!("{}/sys/walt", st().p.proc_);
-    let mut targets: Vec<String> = BOOST_NODES.iter().map(|s| s.to_string()).collect();
-    for n in WALT_BOOST_NODES {
-        targets.push(format!("{}/{}", walt, n));
+/// 在 sysfs 里按目录名找节点（`touch_boost` 挂在 platform device 下面，
+/// 具体 device 名随机型/DT 变，硬编码必然漏）。深度与数量都有上限，只在启动时跑一次。
+fn find_dirs(root: &str, name: &str, max_depth: i32, out: &mut Vec<String>) {
+    fn walk(dir: &str, name: &str, depth: i32, max_depth: i32, budget: &mut i32, out: &mut Vec<String>) {
+        if depth > max_depth || out.len() >= 8 || *budget <= 0 {
+            return;
+        }
+        let rd = match fs::read_dir(dir) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        for e in rd.flatten() {
+            if out.len() >= 8 || *budget <= 0 {
+                return;
+            }
+            let p = e.path();
+            // 必须跳过符号链接：sysfs 里 subsystem/driver 都是链，跟进去会绕到 /sys/bus 甚至成环
+            let md = match fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if md.file_type().is_symlink() || !md.is_dir() {
+                continue;
+            }
+            *budget -= 1;
+            let n = e.file_name().to_string_lossy().to_string();
+            let s = p.display().to_string();
+            if n == name {
+                out.push(s.clone());
+            }
+            walk(&s, name, depth + 1, max_depth, budget, out);
+        }
     }
+    let mut budget = 20000;
+    walk(root, name, 0, max_depth, &mut budget, out);
+}
+
+/// 所有可能关掉触控/输入加速的节点（静态候选 + 运行时扫描）
+pub fn boost_targets() -> Vec<String> {
+    let mut t: Vec<String> = BOOST_NODES.iter().map(|s| s.to_string()).collect();
+    let walt = format!("{}/sys/walt", st().p.proc_);
+    for n in WALT_BOOST_NODES {
+        t.push(format!("{}/{}", walt, n));
+    }
+    // OPLUS 自己的 touch_boost kobject：/sys/devices/platform/**/touch_boost/touch_boost_ms
+    let mut dirs: Vec<String> = Vec::new();
+    find_dirs(&format!("{}/devices/platform", st().p.sys), "touch_boost", 6, &mut dirs);
+    for d in dirs {
+        t.push(format!("{}/touch_boost_ms", d));
+    }
+    t
+}
+
+pub fn boost_off() {
+    let targets = boost_targets();
+    let total = targets.len();
     let mut n = 0;
+    let mut probed = 0;
+    let mut mode = 0;
     st().boost_save.clear();
     for p in targets {
-        if !exists(&p) || !writable(&p) {
+        if !exists(&p) {
+            continue;
+        }
+        probed += 1;
+        if mode == 0 {
+            mode = if p.contains("/sys/walt/") {
+                1
+            } else if p.contains("touch_boost") {
+                2
+            } else {
+                3
+            };
+        }
+        logv(&format!("boost: 找到 {} = {:?}", p, rdline(&p)));
+        if !writable(&p) {
+            logv(&format!("boost: {} 不可写，跳过", p));
             continue;
         }
         if let Some(old) = rdline(&p) {
@@ -665,7 +732,12 @@ pub fn boost_off() {
         }
     }
     st().boost_killed = n;
-    logmsg(&format!("boost: 关闭 {} 个厂商加速节点", n));
+    st().boost_probed = probed;
+    st().boost_mode = mode;
+    logmsg(&format!(
+        "boost: 候选 {} 个，存在 {} 个，已关 {} 个（mode={} 1=WALT 2=oplus_touch 3=legacy）",
+        total, probed, n, mode
+    ));
 }
 
 pub fn boost_restore() {
@@ -676,6 +748,8 @@ pub fn boost_restore() {
     }
     st().boost_save.clear();
     st().boost_killed = 0;
+    st().boost_probed = 0;
+    st().boost_mode = 0;
     if n > 0 {
         logv(&format!("boost: 已还原 {} 个加速节点", n));
     }

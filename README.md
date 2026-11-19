@@ -10,7 +10,7 @@
 - ROOT：KernelSU / SukiSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.4.7 · versionCode 10024 · Rust 静态守护进程（1.5 MB，零依赖、零 fork）
+> v1.4.8 · versionCode 10025 · Rust 静态守护进程（1.5 MB，零依赖、零 fork）
 
 ![首页](shots/1home-light.png)
 
@@ -43,7 +43,7 @@ v1.2 是单个静态 arm64 二进制（`bin/feather`）：1 Hz 轮询、热路�
 |---|---|
 | 频率上限 | 按簇百分比：日常 72% / 超大核 62%，省电 50%/45%，熄屏 30%/25%（随“省电强度”浮动） |
 | uclamp | 后台 30%、前台 55%、top-app 不限；熄屏 20~30% |
-| 厂商 boost | 关 touch/input boost（含 WALT 的 `/proc/sys/walt/input_boost_ms`、`sched_boost_on_input`、`sched_boost`）、`sched_boost`、`cpu_boost` 等节点，退出逐节点还原 |
+| 厂商 boost | 关 touch/input boost（WALT 的 `/proc/sys/walt/input_boost_ms`、`sched_boost_on_input`、`sched_boost`；OPLUS 的 `…/touch_boost/touch_boost_ms` 运行时扫描；通用 `sched_boost`/`cpu_boost` 节点），退出逐节点还原 |
 | 启动瞬开 | 切 App 后 4 秒内临时放开（100%/92%），避免“点开卡一下” |
 | 漂移校正 | 厂商 thermal 改写上限后 10 秒内自动纠正 |
 | 基线保护 | 只快照一次原始上限/下限，退出或卸载只还原到“动手前”，绝不抬高别人设的值 |
@@ -274,7 +274,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.4.7.zip`，在 KernelSU / SukiSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.4.8.zip`，在 KernelSU / SukiSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -296,6 +296,7 @@ sh $ctl mode battery      # auto/daily/battery/game/perf/sleep
 sh $ctl set intensity 70  # 省电强度
 sh $ctl pkg add com.xxx.yyy
 sh $ctl probe             # 只读探测：路径/节点/刷新率/前台，不写任何系统节点
+sh $ctl boost             # 诊断厂商 boost 节点（WALT / oplus touch_boost / legacy 各存在哪些）
 sh $ctl restore           # 立刻还原
 sh $ctl restart
 ```
@@ -359,7 +360,7 @@ python build.py
 > **打包必须走 `build.py`，不要手动 zip。** v1.4.0 的刷机失败就是 Windows 工作区把
 > `customize.sh` 存成了 CRLF，手动打包原样带进 zip，Android 的 `sh` 解析 `then\r` 直接报错。
 > 现在 `build.py` 会归一化、自检，并把 `bin/feather` 的权限位写成 `0755`。
-> 想手工核对：`unzip -p dist/FeatherTune_v1.4.7.zip customize.sh | grep -c $'\r'` 必须是 0。
+> 想手工核对：`unzip -p dist/FeatherTune_v1.4.8.zip customize.sh | grep -c $'\r'` 必须是 0。
 
 ```
 rust/main.rs           daemon 主循环 + CLI + 启动/单实例/信号
@@ -373,7 +374,7 @@ rust/net.rs            UNIX socket 控制口 + 127.0.0.1 HTTP 桥（poll 单线�
 src/feather.c          v1.3.4 的 C 实现，保留作对照（tools/build_arm64_c.sh 可编）
 module/                Magisk/KSU/APatch 模块骨架（含 webroot/）
 module/bin/shell/      v1.0 的 shell 实现，仅作二进制跑不起来时的兜底
-tests/                 108 项端到端测试 + 假文件树 + arm64 冒烟脚本
+tests/                 112 项端到端测试 + 假文件树 + arm64 冒烟脚本
 docs/DESIGN.md         设计取舍、源码分析、每一轮实测复盘
 docs/FIXES_1.4.1.md    CRLF 刷机失败 / 图标链路 / charger v2 限流的根因与修复
 docs/FIXES_1.4.2.md    图标覆盖 / 双电芯功率 / 充电为何没有提升

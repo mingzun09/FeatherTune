@@ -66,6 +66,12 @@ mkf "$W/sched_boost" 1
 mkf "$W/sched_upmigrate" 762
 mkf "$W/sched_downmigrate" 500
 
+# OPLUS 自己的 touch_boost kobject（真机挂在 /sys/devices/platform/**/touch_boost/）
+TT="$ROOT/sys/devices/platform/soc/oplus-touch-boost/touch_boost"
+mkdir -p "$TT"
+mkf "$TT/touch_boost_ms" 300
+mkf "$TT/touch_boost_freq" 1800000
+
 # ---------------- cgroup v2
 for g in top-app foreground background system-background; do
   mkf "$ROOT/sys/fs/cgroup/$g/cpu.uclamp.max" "max 100%"
