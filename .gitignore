@@ -14,6 +14,8 @@ tests/data/
 tests/*.trace
 tests/tmp/
 tests/fakebin/
+tests/topo44/
+tests/data44/
 
 # 本地调试脚本生成的产物
 shots/*.tmp
