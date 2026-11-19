@@ -61,7 +61,8 @@ fn run_daemon() -> i32 {
     if let Some(f) = lock_file.as_ref() {
         if unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
             eprintln!("featherd-daemon: already running, exit");
-            return 0;
+            // service.sh 的看护循环约定：rc=3 表示「已有实例」→ 停止重启，避免热循环
+            return 3;
         }
     }
 
@@ -449,7 +450,7 @@ fn do_reset() {
 fn cli_main() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {
-        println!("usage: feather <run|start|stop|restart|status|set|mode|doctor|pkg|apps|log|restore|reset|charge|boost|version>");
+        println!("usage: feather <run|start|stop|restart|status|set|mode|doctor|pkg|apps|log|restore|reset|charge|boost|masks|version>");
         return 2;
     }
     let c = argv[1].as_str();

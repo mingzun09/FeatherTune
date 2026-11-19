@@ -1,16 +1,17 @@
 # 羽量调校 · FeatherTune
 
-面向 **OnePlus 15 / SM8850（骁龙 8 Elite Gen 5，2×Oryon Prime + 6×Oryon Performance，无小核）** 的
+面向 **OnePlus 15 / 15T / Pad（SM8850，骁龙 8 Elite Gen 5，2×Oryon Prime + 6×Oryon Performance，无小核）** 的
 场景化功耗与调度调校模块。
 
 不是无脑降频：日常按负载收紧频率上限、压掉厂商的频繁 boost、给后台降 uclamp；游戏时把频率控制权
 让给 Oplus 风驰（`hmbird` / sched_ext），只做它管不到的事——线程归位与帧预算对齐。
 
 - 适配：Android 15 / 16 / 17（ARM64）
+- 机型：一加 15 / 15T / Pad 3 Pro / Pad 4 —— 机型名、Android 版本、CPU 拓扑全部运行时探测，不写死
 - ROOT：KernelSU / SukiSU / Magisk / APatch；可与元模块（meta-overlayfs 等）共存
 - WebUI：`webroot/`，模块卡片直接打开；管理器禁用了 `exec` 时用浏览器访问 `http://127.0.0.1:7891/`
 
-> v1.4.9 · versionCode 10026 · Rust 静态守护进程（1.5 MB，零依赖、零 fork）
+> v1.5.0 · versionCode 10100 · Rust 静态守护进程（1.5 MB，零依赖、零 fork）
 
 ![首页](shots/1home-light.png)
 
@@ -274,7 +275,7 @@ v1.1 的 7% 电流是**靠压频硬压**出来的：所有线程同比膨胀 24%
 
 ## 四、安装
 
-1. 下载 `FeatherTune_v1.4.9.zip`，在 KernelSU / SukiSU / Magisk / APatch 里 **从本地安装**
+1. 下载 `FeatherTune_v1.5.0.zip`，在 KernelSU / SukiSU / Magisk / APatch 里 **从本地安装**
 2. 重启（或在 WebUI 里点“重启守护进程”）
 3. 自检：
 
@@ -297,9 +298,20 @@ sh $ctl set intensity 70  # 省电强度
 sh $ctl pkg add com.xxx.yyy
 sh $ctl probe             # 只读探测：路径/节点/刷新率/前台，不写任何系统节点
 sh $ctl boost             # 诊断厂商 boost 节点（WALT / oplus touch_boost / legacy 各存在哪些）
+sh $ctl masks             # 拓扑与规则目标掩码（换机型先看这个）
 sh $ctl restore           # 立刻还原
 sh $ctl restart
 ```
+
+### 机型/拓扑自适应（v1.5.0）
+
+- WebUI 顶部机型取 `ro.product.marketname` → `model` → `device`（新增 `/my_product/build.prop`
+  与 `getprop` 兜底），不会再在 15T 上显示「OnePlus 15」
+- `rules.conf` 里的 `prime/prime1/prime2/perf/mid/low/bg` 全部按 `affected_cpus` 现算，
+  4+4、3 簇、policy 编号不同都能正确落核；`hmbird` 的 `prefer_cluster` 也按 policy 序号换算
+- `service.sh` 的看护锁改成「pid 存活才算占用」，并在 `post-fs-data` / `boot-completed` 清残留锁，
+  修掉「打完游戏或软重启后守护进程起不来、只能重装」（issue #1）
+- 细节见 [docs/COMPAT.md](docs/COMPAT.md)
 
 ---
 
@@ -360,7 +372,7 @@ python build.py
 > **打包必须走 `build.py`，不要手动 zip。** v1.4.0 的刷机失败就是 Windows 工作区把
 > `customize.sh` 存成了 CRLF，手动打包原样带进 zip，Android 的 `sh` 解析 `then\r` 直接报错。
 > 现在 `build.py` 会归一化、自检，并把 `bin/feather` 的权限位写成 `0755`。
-> 想手工核对：`unzip -p dist/FeatherTune_v1.4.9.zip customize.sh | grep -c $'\r'` 必须是 0。
+> 想手工核对：`unzip -p dist/FeatherTune_v1.5.0.zip customize.sh | grep -c $'\r'` 必须是 0。
 
 ```
 rust/main.rs           daemon 主循环 + CLI + 启动/单实例/信号
@@ -374,13 +386,14 @@ rust/net.rs            UNIX socket 控制口 + 127.0.0.1 HTTP 桥（poll 单线�
 src/feather.c          v1.3.4 的 C 实现，保留作对照（tools/build_arm64_c.sh 可编）
 module/                Magisk/KSU/APatch 模块骨架（含 webroot/）
 module/bin/shell/      v1.0 的 shell 实现，仅作二进制跑不起来时的兜底
-tests/                 114 项端到端测试 + 假文件树 + arm64 冒烟脚本
+tests/                 118 项端到端测试 + 假文件树 + arm64 冒烟脚本
 docs/DESIGN.md         设计取舍、源码分析、每一轮实测复盘
 docs/FIXES_1.4.1.md    CRLF 刷机失败 / 图标链路 / charger v2 限流的根因与修复
 docs/FIXES_1.4.2.md    图标覆盖 / 双电芯功率 / 充电为何没有提升
 docs/SPEC_CHECK.md     对《SM8850 调度优化提示词》的逐条核对（WALT vs hmbird）
 docs/CHG_SPEC_CHECK.md 对《满血快充 Rust 守护进程提示词》的核对（v1/v2 充电栈差异）
 docs/CHG_EFFECT.md     为什么只有 67W / charge sweep 实测与适配器天花板
+docs/COMPAT.md          机型/拓扑自适应、看护锁修复、调度文献结论
 ```
 
 > 为什么 Rust 版比 C 版大（860KB → 1.5MB）：`std` 静态链进去就是这样。换来的是

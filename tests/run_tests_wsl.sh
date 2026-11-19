@@ -124,6 +124,27 @@ check "doctor 报 WALT 与 governor"  'echo "$out" | grep -q "^walt=yes" && echo
 # 注意：测试树挂在 /mnt/d（drvfs 不支持 AF_UNIX socket），守护进程的 socket 绑不上，
 # CLI 一律本地计算；boost 的运行时计数只能从 daemon 写的 state 文件里读。
 check "state 回填 boost_probed/boost_mode" 'grep -qx "boost_probed=4" "$DATA/state" && grep -qx "boost_mode=1" "$DATA/state"' "$(grep -E '^boost_(probed|mode)=' "$DATA/state" 2>/dev/null | tr '\n' ' ')"
+MOUT=$("$BIN" masks 2>&1)
+check "masks 按实际拓扑换算" 'echo "$MOUT" | grep -q "perf=0x3f prime=0xc0 prime1=0x80 prime2=0x40"' "$(echo "$MOUT" | grep targets:)"
+check "masks 报 policy 与角色" 'echo "$MOUT" | grep -q "pol policy0 cpus=0,1,2,3,4,5.*role=perf" && echo "$MOUT" | grep -q "pol policy6 cpus=6,7.*role=prime"' "$(echo "$MOUT" | grep '^pol ' | tr '\n' ' ')"
+# 自造一个 4+4 拓扑（policy 名与核数都和一加15不同）验证掩码是真算出来的
+T3="$HERE/topo44"; rm -rf "$T3"
+mk_pol() { # 名字 最高频 cpus
+  d="$T3/sys/devices/system/cpu/cpufreq/$1"; mkdir -p "$d"
+  echo "$2" > "$d/cpuinfo_max_freq"
+  echo 1000000 > "$d/cpuinfo_min_freq"
+  echo "$3" > "$d/affected_cpus"
+  echo "1800000 2400000 $2" > "$d/scaling_available_frequencies"
+}
+mk_pol policy0 3200000 "0 1 2 3"
+mk_pol policy4 4608000 "4 5 6 7"
+D3="$HERE/data44"; rm -rf "$D3"; mkdir -p "$D3"
+M3=$(FEATHER_DATA="$D3" FEATHER_CPU_ROOT="$T3/sys/devices/system/cpu" \
+     FEATHER_SYS_ROOT="$T3/sys" FEATHER_PROC_ROOT="$T3/proc" \
+     FEATHER_CGROUP_ROOT="$T3/sys/fs/cgroup" FEATHER_HMBIRD_SYS="$T3/proc/sys/hmbird_II" \
+     "$BIN" masks 2>&1)
+check "4+4 拓扑 → perf=0xf prime=0xf0" 'echo "$M3" | grep -q "perf=0xf prime=0xf0 prime1=0x80 prime2=0x40"' "$(echo "$M3" | grep targets:)"
+check "4+4 拓扑 → mid/low/bg 随核数变" 'echo "$M3" | grep -q "mid=0xc low=0x3 bg=0x3 all=0xff"' "$(echo "$M3" | grep targets:)"
 check "doctor 报 daemon_pin/perf_mask" 'echo "$out" | grep -q "^daemon_pin=1 perf_mask=0x3f"' "$(echo "$out" | grep '^daemon_pin')"
 
 echo "== 2.5 规则加载 =="
@@ -183,7 +204,7 @@ check "tune=1 时写 cpus_reserved" 'grep -qx 192 "$FAKE/proc/sys/hmbird_II/cpus
 echo "== 5. 切普通应用 -> 日常收紧 =="
 echo "com.test.app" > "$FAKE_WIN_FG"
 printf '5555\n' > "$FAKE/sys/fs/cgroup/top-app/cgroup.procs"
-sleep 6
+wait_state "profile=daily" 20
 S=$(cat "$DATA/state" 2>/dev/null)
 check "profile=daily"             'echo "$S" | grep -qx "profile=daily"' "$(echo "$S" | grep profile=)"
 PF=$(echo "$S" | sed -n 's/^cap_perf=//p'); PR=$(echo "$S" | sed -n 's/^cap_prime=//p')
@@ -399,7 +420,7 @@ check "失败回落 daemon 抠图"       'grep -q "data-fb=" "$PROJ/module/webro
 
 echo "== 6. 熄屏 =="
 printf '0\n' > "$FAKE/sys/class/backlight/panel0-backlight/brightness"
-sleep 5
+wait_state "profile=sleep" 20
 S=$(cat "$DATA/state" 2>/dev/null)
 check "profile=sleep"             'echo "$S" | grep -qx "profile=sleep"' "$(echo "$S" | grep profile=)"
 PF=$(echo "$S" | sed -n 's/^cap_perf=//p')

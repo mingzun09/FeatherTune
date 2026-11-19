@@ -44,6 +44,20 @@ pub fn detect_topology() {
             }
             freq.sort_unstable_by(|a, b| b.cmp(a));
             freq.truncate(MAX_FREQ);
+            // affected_cpus 才是这个 policy 真正管的核；读不到就按 policyN 的 N 兜底
+            let mut cpus: Vec<u32> = Vec::new();
+            if let Some(s) = rdline(&format!("{}/affected_cpus", path)) {
+                let m = cpulist_mask(&s);
+                for c in 0..64u32 {
+                    if m & (1u64 << c) != 0 {
+                        cpus.push(c);
+                    }
+                }
+            }
+            if cpus.is_empty() {
+                let idx = name.trim_start_matches("policy").parse::<u32>().unwrap_or(0);
+                cpus.push(idx);
+            }
             pols.push(Policy {
                 path,
                 name,
@@ -51,6 +65,7 @@ pub fn detect_topology() {
                 min,
                 freq,
                 is_prime: false,
+                cpus,
             });
         }
     }
@@ -624,6 +639,140 @@ pub fn pin_self_to_perf() -> bool {
     ok
 }
 
+/// 某个 policy 管的 CPU 列表
+pub fn pol_cpus(idx: isize) -> Vec<u32> {
+    if idx < 0 || idx as usize >= st().pol.len() {
+        return Vec::new();
+    }
+    st().pol[idx as usize].cpus.clone()
+}
+
+pub fn perf_cpus() -> Vec<u32> {
+    pol_cpus(st().idx_perf)
+}
+
+pub fn prime_cpus() -> Vec<u32> {
+    if st().idx_prime == st().idx_perf {
+        return Vec::new(); // 只有一个簇的机器，没有独立超大核
+    }
+    pol_cpus(st().idx_prime)
+}
+
+pub fn mask_str(cpus: &[u32]) -> String {
+    let mut m: u64 = 0;
+    for &c in cpus {
+        if c < 64 {
+            m |= 1u64 << c;
+        }
+    }
+    format!("0x{:x}", m)
+}
+
+/// 掩码落在哪些簇上 → hmbird 的 prefer_cluster 位图（policy 序号当簇号）
+pub fn cluster_bit_of(hexmask: &str) -> String {
+    let m = parse_hex(hexmask);
+    let mut bit: u32 = 0;
+    for i in 0..st().pol.len() {
+        let pm = st().pol[i].cpus.iter().fold(0u64, |a, &c| {
+            if c < 64 {
+                a | (1u64 << c)
+            } else {
+                a
+            }
+        });
+        if pm & m != 0 {
+            bit |= 1 << i;
+        }
+    }
+    if bit == 0 {
+        bit = 1;
+    }
+    format!("0x{:x}", bit)
+}
+
+/// 规则目标 → 掩码（全部按实际拓扑算，不再写死 0x3F/0xC0）
+pub fn target_mask(t: &str) -> Option<String> {
+    let perf = perf_cpus();
+    let prime = prime_cpus();
+    let pick = |v: &[u32]| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(mask_str(v))
+        }
+    };
+    match t {
+        "prime" => pick(&prime),
+        // prime1/prime2 沿用老语义：prime1 是簇内编号最大的那颗（一加15 = CPU7），prime2 = CPU6
+        "prime1" => prime.last().map(|c| mask_str(&[*c])),
+        "prime2" => {
+            if prime.len() >= 2 {
+                prime.get(prime.len() - 2).map(|c| mask_str(&[*c]))
+            } else {
+                None
+            }
+        }
+        "perf" => pick(&perf),
+        "mid" => {
+            let n = perf.len();
+            if n >= 3 {
+                pick(&perf[n * 2 / 3..])
+            } else {
+                pick(&perf)
+            }
+        }
+        "low" => {
+            let n = perf.len();
+            let cut = (n * 2 / 3).max(1);
+            pick(&perf[..cut.min(n)])
+        }
+        "bg" => {
+            let n = perf.len().min(2);
+            pick(&perf[..n])
+        }
+        "all" => {
+            let mut a = perf.clone();
+            a.extend(prime.iter().copied());
+            a.sort_unstable();
+            a.dedup();
+            pick(&a)
+        }
+        _ => None,
+    }
+}
+
+/// 规则目标 → 掩码 的一行摘要（真机排查非标准拓扑，比如 15T / Pad 的 policy 划分）
+pub fn masks_lines() -> String {
+    let mut o = String::new();
+    for (i, p) in st().pol.iter().enumerate() {
+        let role = if i as isize == st().idx_prime {
+            "prime"
+        } else if i as isize == st().idx_perf {
+            "perf"
+        } else {
+            "-"
+        };
+        let cpus: Vec<String> = p.cpus.iter().map(|c| c.to_string()).collect();
+        o.push_str(&format!(
+            "pol {} cpus={} max={} role={}\n",
+            p.name,
+            cpus.join(","),
+            p.max,
+            role
+        ));
+    }
+    let mut t = String::new();
+    for k in ["perf", "prime", "prime1", "prime2", "mid", "low", "bg", "all"] {
+        t.push_str(&format!(
+            "{}={} ",
+            k,
+            target_mask(k).unwrap_or_else(|| "-".to_string())
+        ));
+    }
+    o.push_str(&format!("targets: {}\n", t.trim_end()));
+    o
+}
+
 // ------------------------------------------------------- boost / io / gpu ----
 const BOOST_NODES: [&str; 8] = [
     "/sys/module/msm_performance/parameters/touch_boost",
@@ -1028,7 +1177,7 @@ fn pin_tid(tid: i64, hexmask: &str) {
         } else {
             // 1) 只给簇，让 hmbird 自己挑核
             let pc = format!("{}/prefer_cluster", st().p.hm);
-            if wrverify(&pc, &format!("{} {}", tid, cluster_of(hexmask))) {
+            if wrverify(&pc, &format!("{} {}", tid, cluster_bit_of(hexmask))) {
                 st().pin_kind = 1;
                 return;
             }
@@ -1131,15 +1280,15 @@ pub fn apply_threads(pid: i64, pkg: &str) {
                     }
                     continue;
                 }
-                let mut m = mask_of(part);
-                if m.is_none() && part.starts_with("0x") {
-                    // 规则里可能直接写掩码
-                    let owned = part.to_string();
-                    let leaked: &'static str = Box::leak(owned.into_boxed_str());
-                    m = Some(leaked);
-                }
+                let m = mask_of(part).or_else(|| {
+                    if part.starts_with("0x") {
+                        Some(part.to_string())
+                    } else {
+                        None
+                    }
+                });
                 if let Some(mm) = m {
-                    pin_tid(tid, mm);
+                    pin_tid(tid, &mm);
                     pinned_any = true;
                 }
             }

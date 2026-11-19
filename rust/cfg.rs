@@ -295,17 +295,8 @@ pub fn is_game(pkg: &str) -> bool {
 
 // ------------------------------------------------------------------ rules ----
 /// 掩码：prime=CPU6-7 等
-pub fn mask_of(t: &str) -> Option<&'static str> {
-    match t {
-        "prime" => Some("0xC0"),   // CPU6-7 超大核簇
-        "prime1" => Some("0x80"),  // CPU7 单核
-        "prime2" => Some("0x40"),  // CPU6 单核
-        "perf" => Some("0x3F"),    // CPU0-5
-        "mid" => Some("0x30"),     // CPU4-5
-        "low" => Some("0x0F"),     // CPU0-3
-        "bg" => Some("0x03"),      // CPU0-1
-        _ => None,
-    }
+pub fn mask_of(t: &str) -> Option<String> {
+    crate::cpu::target_mask(t)
 }
 
 pub fn rules_load() {
@@ -388,12 +379,32 @@ pub fn rules_load() {
 }
 
 // ------------------------------------------------------------- build.prop ----
+/// 机型/系统信息：先扫 build.prop（快），缺的再用 getprop 补齐（准）。
+/// ColorOS 的 ro.product.marketname / ro.product.model 常在 /my_product/build.prop，
+/// 老实现只扫 /system 与 /vendor，结果 model 为空、WebUI 退回硬编码的「OnePlus 15」。
 pub fn read_buildprops() {
+    fn set_prop(k: &str, v: &str) {
+        let v = v.trim();
+        if v.is_empty() {
+            return;
+        }
+        match k {
+            "ro.product.marketname" if st().market.is_empty() => st().market = v.to_string(),
+            "ro.product.model" if st().model.is_empty() => st().model = v.to_string(),
+            "ro.product.device" if st().device.is_empty() => st().device = v.to_string(),
+            "ro.board.platform" if st().platform.is_empty() => st().platform = v.to_string(),
+            "ro.build.version.release" if st().android.is_empty() => st().android = v.to_string(),
+            _ => {}
+        }
+    }
+
     let files = [
+        "/my_product/build.prop",
         "/system/build.prop",
         "/vendor/build.prop",
         "/odm/etc/build.prop",
         "/product/build.prop",
+        "/system_ext/build.prop",
     ];
     for f in files {
         let text = match fs::read_to_string(f) {
@@ -409,16 +420,34 @@ pub fn read_buildprops() {
                 Some(i) => i,
                 None => continue,
             };
-            let k = &s[..eq];
-            let v = s[eq + 1..].trim_end_matches(['\r', '\n']);
-            if k == "ro.product.model" && st().model.is_empty() {
-                st().model = v.to_string();
-            } else if k == "ro.build.version.release" && st().android.is_empty() {
-                st().android = v.to_string();
-            }
+            set_prop(&s[..eq], &s[eq + 1..]);
         }
-        if !st().model.is_empty() && !st().android.is_empty() {
-            break;
+    }
+
+    // build.prop 里没有的（或机型把值放在别的分区）再问一次系统。
+    // 非 Android 环境（测试机/qemu）没有 getprop，跳过，免得每个命令都往 stderr 打一串错。
+    if !exists("/system/bin/getprop") && !exists("/system/bin/getprop64") {
+        return;
+    }
+    for k in [
+        "ro.product.marketname",
+        "ro.product.model",
+        "ro.product.device",
+        "ro.board.platform",
+        "ro.build.version.release",
+    ] {
+        let need = match k {
+            "ro.product.marketname" => st().market.is_empty(),
+            "ro.product.model" => st().model.is_empty(),
+            "ro.product.device" => st().device.is_empty(),
+            "ro.board.platform" => st().platform.is_empty(),
+            _ => st().android.is_empty(),
+        };
+        if !need {
+            continue;
+        }
+        if let Some(v) = popen_all(&format!("getprop {}", k), 2) {
+            set_prop(k, &v);
         }
     }
 }

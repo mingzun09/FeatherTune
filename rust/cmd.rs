@@ -744,6 +744,7 @@ pub fn run_cmd(line: &str) -> String {
         }
         "charge" => return cmd_charge(args.get(1).copied().unwrap_or(""), args.get(2).copied()),
         "boost" => return cmd_boost(),
+        "masks" => return masks_lines(),
         "version" => return format!("{} ({})\n", crate::state::APP_VER, crate::state::APP_VC),
         "power" => return cmd_power(),
         "probe" => return cmd_probe(),
@@ -1535,14 +1536,10 @@ fn cmd_status() -> String {
         if st().hb_present { 1 } else { 0 }
     ));
     out.push_str(&sched_probe_lines());
-    out.push_str(&format!(
-        "model={}\n",
-        if st().model.is_empty() {
-            "OnePlus 15"
-        } else {
-            &st().model
-        }
-    ));
+    out.push_str(&format!("market={}\n", st().market));
+    out.push_str(&format!("model={}\n", st().model));
+    out.push_str(&format!("device={}\n", st().device));
+    out.push_str(&format!("platform={}\n", st().platform));
     out.push_str(&format!("android={}\n", st().android));
     let c = &st().c;
     out.push_str(&format!("cfg_enable={}\n", c.enable));
@@ -1794,6 +1791,7 @@ fn cmd_doctor() -> String {
         "boost: mode={} (1=WALT 2=oplus_touch 3=legacy) probed={} killed={}\n",
         st().boost_mode, st().boost_probed, st().boost_killed
     ));
+    out.push_str(&masks_lines());
     for p in boost_targets() {
         if exists(&p) {
             out.push_str(&format!(

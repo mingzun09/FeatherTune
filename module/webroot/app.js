@@ -236,10 +236,13 @@ function render() {
   pill.classList.toggle('off', !running);
   pill.querySelector('span').textContent = running ? '运行中' : '已停止';
 
-  const model = state.model || 'OnePlus 15';
+  // 机型/系统版本一律来自系统属性（marketname → model → device），不再硬编码「OnePlus 15」
+  const model = state.market || state.model || state.device || '未知机型';
   const andr = state.android || '';
   $('#subtitle').textContent = `${model}${andr ? ' · Android ' + andr : ''}` +
     (state.hmbird === '1' ? ' · 风驰内核' : '');
+  $('#subtitle').title = [state.market, state.model, state.device, state.platform]
+    .filter(Boolean).join(' / ');
   const sl = $('#statusline');
   if (sl) sl.textContent = `${PROFILE_CN[p] || p} · ${TRANSPORT_CN[TRANSPORT] || TRANSPORT}`;
 

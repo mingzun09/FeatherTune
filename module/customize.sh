@@ -16,7 +16,7 @@ DATA=/data/adb/feather
 command -v ui_print >/dev/null 2>&1 || ui_print() { echo "$1"; }
 command -v abort >/dev/null 2>&1 || abort() { ui_print "! $1"; exit 1; }
 
-ui_print "- 羽量调校 FeatherTune v1.4.9"
+ui_print "- 羽量调校 FeatherTune v1.5.0"
 ui_print "- SoC: $(getprop ro.board.platform 2>/dev/null) / $(getprop ro.product.model 2>/dev/null)"
 ui_print "- Android $(getprop ro.build.version.release 2>/dev/null) (SDK $(getprop ro.build.version.sdk 2>/dev/null))"
 

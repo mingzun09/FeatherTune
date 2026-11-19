@@ -11,8 +11,8 @@
 #![allow(static_mut_refs)]
 
 // ------------------------------------------------------------------ 常量 ----
-pub const APP_VER: &str = "v1.4.9";
-pub const APP_VC: i32 = 10026;
+pub const APP_VER: &str = "v1.5.0";
+pub const APP_VC: i32 = 10100;
 pub const MAX_FREQ: usize = 64;
 pub const MAX_POL: usize = 4;
 pub const MAX_RULES: usize = 64;
@@ -195,6 +195,8 @@ pub struct Policy {
     pub min: i64,
     pub freq: Vec<i64>,
     pub is_prime: bool,
+    /// 这个 policy 实际管的 CPU 列表（来自 affected_cpus）；规则目标据此动态换算掩码
+    pub cpus: Vec<u32>,
 }
 
 // -------------------------------------------------------------- 充电节点 ----
@@ -255,6 +257,12 @@ pub struct State {
 
     pub refresh: i64,
     pub model: String,
+    /// 厂商营销名（ColorOS: ro.product.marketname，如「一加 15T」）
+    pub market: String,
+    /// ro.product.device，如 OP5D0B / PLK110
+    pub device: String,
+    /// ro.board.platform，如 sun / canoe
+    pub platform: String,
     pub android: String,
 
     pub uclamp_ok: bool,
@@ -370,6 +378,9 @@ impl State {
             base_ok: false,
             refresh: 0,
             model: String::new(),
+            market: String::new(),
+            device: String::new(),
+            platform: String::new(),
             android: String::new(),
             uclamp_ok: true,
             uclamp_touched: false,

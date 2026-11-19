@@ -622,15 +622,6 @@ pub fn mkdir_p(path: &str) {
 }
 
 /// 把掩码串写成 "0x.." 之外的原样输出（C 版直接透传）
-pub fn cluster_of(mask: &str) -> &'static str {
-    let m = parse_hex(mask);
-    if m & 0xC0 != 0 {
-        "0x2"
-    } else {
-        "0x1"
-    }
-}
-
 // ------------------------------------------------------- 外部命令（popen） ----
 // 为什么不用 std::process::Command：它走 posix_spawn（clone + CLONE_VFORK），
 // 在 qemu-user 下子进程根本不会 exec（arm64 回归会整片假失败）；popen 走 fork+exec，
